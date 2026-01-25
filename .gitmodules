@@ -1,0 +1,3 @@
+[submodule "receivable-agents"]
+	path = receivable-agents
+	url = git@github.com:bhanu-singh/receivable-agents.git
