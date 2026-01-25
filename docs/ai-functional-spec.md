@@ -852,8 +852,177 @@ Before sending reminders, please verify:
 ---
 
 ## 5. Data Model Extensions
+### 5.1 Core Entities
 
-### 5.1 New AI Entities
+#### Company
+```
+id: UUID (PK)
+name: String
+slug: String (unique, for email)
+email: String
+default_payment_terms: Integer (days)
+default_currency: String (ISO 4217)
+eu_regulation_enabled: Boolean
+created_at: Timestamp
+updated_at: Timestamp
+```
+
+#### User
+```
+id: UUID (PK)
+company_id: UUID (FK)
+email: String (unique)
+password_hash: String
+name: String
+timezone: String
+email_notifications: JSONB
+created_at: Timestamp
+last_login_at: Timestamp
+```
+
+#### Customer
+```
+id: UUID (PK)
+company_id: UUID (FK)
+name: String
+email: String
+contact_person: String (nullable)
+default_payment_terms: Integer (nullable)
+notes: Text (nullable)
+created_at: Timestamp
+updated_at: Timestamp
+```
+
+#### Invoice
+```
+id: UUID (PK)
+company_id: UUID (FK)
+customer_id: UUID (FK)
+invoice_number: String
+amount: Decimal(10,2)
+currency: String (ISO 4217)
+invoice_date: Date
+payment_terms_days: Integer
+due_date: Date
+status: Enum (pending, due_soon, overdue, paid)
+file_url: String (nullable)
+last_reminder_date: Timestamp (nullable)
+next_action_date: Timestamp (nullable)
+reminder_sequence_step: Integer (default 0)
+ocr_processed: Boolean (default false)
+ocr_confidence_score: Decimal(3,2) (nullable, 0.00-1.00)
+ocr_extracted_data: JSONB (nullable, stores raw OCR results)
+sevdesk_invoice_id: String (nullable, external ID)
+sevdesk_synced_at: Timestamp (nullable)
+sevdesk_sync_status: Enum (not_synced, synced, sync_failed) (default 'not_synced')
+created_at: Timestamp
+updated_at: Timestamp
+
+Index: company_id, customer_id, status, due_date, sevdesk_invoice_id
+```
+
+#### Payment
+```
+id: UUID (PK)
+invoice_id: UUID (FK)
+amount: Decimal(10,2)
+payment_date: Date
+payment_method: Enum (bank_transfer, check, cash, other)
+source: Enum (manual, csv_import)
+notes: Text (nullable)
+created_at: Timestamp
+```
+
+#### ReminderEvent
+```
+id: UUID (PK)
+invoice_id: UUID (FK)
+template_type: Enum (friendly, firm)
+sent_at: Timestamp
+recipient_email: String
+delivery_status: Enum (sent, failed, bounced)
+opened_at: Timestamp (nullable)
+is_manual: Boolean (default false)
+created_at: Timestamp
+```
+
+#### ReminderSequence
+```
+id: UUID (PK)
+company_id: UUID (FK)
+steps: JSONB
+  [
+    {day_offset: -5, template: 'friendly', enabled: true},
+    {day_offset: 0, template: 'friendly', enabled: true},
+    {day_offset: 7, template: 'friendly', enabled: true},
+    {day_offset: 21, template: 'firm', enabled: true}
+  ]
+created_at: Timestamp
+updated_at: Timestamp
+```
+
+#### EmailTemplate
+```
+id: UUID (PK)
+company_id: UUID (FK)
+template_type: Enum (friendly, firm)
+subject: String
+body: Text (HTML)
+created_at: Timestamp
+updated_at: Timestamp
+```
+
+#### AccountingIntegration
+```
+id: UUID (PK)
+company_id: UUID (FK)
+provider: Enum (sevdesk, SevDesk, xero, lexoffice)
+access_token: String (encrypted)
+refresh_token: String (encrypted, nullable)
+token_expires_at: Timestamp (nullable)
+sync_direction: Enum (import, export, bidirectional)
+auto_sync_enabled: Boolean (default false)
+auto_sync_time: Time (nullable, default 02:00)
+last_sync_at: Timestamp (nullable)
+last_sync_status: Enum (success, failed, partial)
+last_sync_error: Text (nullable)
+sync_config: JSONB (nullable, provider-specific config)
+created_at: Timestamp
+updated_at: Timestamp
+
+Index: company_id, provider
+```
+
+#### SyncLog
+```
+id: UUID (PK)
+integration_id: UUID (FK)
+sync_type: Enum (manual, automatic)
+direction: Enum (import, export, bidirectional)
+records_synced: Integer
+records_failed: Integer
+status: Enum (success, failed, partial)
+error_message: Text (nullable)
+started_at: Timestamp
+completed_at: Timestamp (nullable)
+created_at: Timestamp
+
+Index: integration_id, started_at
+```
+
+### 5.2 Relationships
+- Company → Users (1:N)
+- Company → Customers (1:N)
+- Company → Invoices (1:N)
+- Company → ReminderSequence (1:1)
+- Company → EmailTemplates (1:N)
+- Company → AccountingIntegrations (1:N)
+- Customer → Invoices (1:N)
+- Invoice → Payments (1:N)
+- Invoice → ReminderEvents (1:N)
+- AccountingIntegration → SyncLogs (1:N)
+
+### 5.2 New AI Entities
 
 #### AIConversation
 ```
