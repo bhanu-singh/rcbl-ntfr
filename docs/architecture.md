@@ -1,9 +1,9 @@
 # System Architecture Document
 ## Receivable Notification System (RCBL)
 
-**Document Version:** 2.0  
-**Last Updated:** February 8, 2026  
-**Architecture Style:** Multi-Tenant SaaS, Modular Monolith (MVP) → Microservices-ready  
+**Document Version:** 3.0  
+**Last Updated:** February 15, 2026  
+**Architecture Style:** Multi-Tenant SaaS, Service-Oriented (Backend + AI Agent Service)  
 **Reference:** Based on `ai-functional-spec.md` v2.0
 
 ---
@@ -18,7 +18,7 @@
 6. [Backend Architecture](#6-backend-architecture)
 7. [Frontend Architecture](#7-frontend-architecture)
 8. [Cron & Background Jobs](#8-cron--background-jobs)
-9. [AI Agent Architecture (LangGraph)](#9-ai-agent-architecture-langgraph)
+9. [AI Agent Architecture (LangGraph Platform -- Separate Repo)](#9-ai-agent-architecture-langgraph-platform----separate-repo)
 10. [Data Layer](#10-data-layer)
 11. [Infrastructure & Deployment](#11-infrastructure--deployment)
 12. [Security Architecture](#12-security-architecture)
@@ -32,9 +32,9 @@
 | Principle | Rationale |
 |-----------|-----------|
 | **Tenant isolation at the data layer** | Every table carries `company_id`; Row-Level Security enforces isolation at the DB level |
-| **Modular monolith first** | Ship fast with one Python codebase; backend, worker, and AI agent share the same repo and packages |
+| **Two-repo separation** | Backend (`rcbl-backend`) and AI agents (`receivable-agents`) are independent repos, independently deployable and scalable |
 | **Async by default** | All heavy work (OCR, sync, emails, AI) goes through a Redis job queue; API calls return immediately |
-| **AI as a module, not a service** | Since backend and AI are both Python, LangGraph agents live in the same codebase as a module -- deployable as same or separate process |
+| **AI as a separate service** | LangGraph agents run on LangGraph Platform in the `receivable-agents` repo; the backend calls them via the `langgraph-sdk` Python client over HTTP |
 | **Cron as external trigger** | Hetzner Cron Jobs calls protected HTTP endpoints on the backend; no in-process scheduler needed |
 | **Feature-flag everything post-MVP** | AI capabilities are gated behind feature flags per tenant so they can be rolled out progressively |
 | **Zero-trust multi-tenancy** | Never rely only on application logic for tenant isolation; RLS is the last line of defense |
@@ -101,14 +101,18 @@ C4Container
 
     Person(user, "SME User", "Uses web browser")
 
-    Container_Boundary(rcbl, "RCBL Platform") {
+    Container_Boundary(rcbl, "RCBL Platform (rcbl-backend repo)") {
         Container(spa, "Frontend SPA", "React 18, TypeScript, TailwindCSS, Vite", "User interface for all screens")
         Container(proxy, "Reverse Proxy", "Caddy / Nginx / Fly Proxy", "TLS termination, routing, rate limiting")
-        Container(api, "Backend API", "Python 3.12, FastAPI, SQLAlchemy, Pydantic", "REST API, Auth (JWT), SSE, Webhook receiver, Cron endpoints")
-        Container(worker, "Queue Worker", "Python 3.12, arq/rq, same codebase", "Consumes Redis queues: OCR, CSV, email, sync, webhook processing")
+        Container(api, "Backend API", "Python 3.12, FastAPI, SQLAlchemy, Pydantic", "REST API, Auth (JWT), SSE, Webhook receiver, Cron endpoints. Calls agents via langgraph-sdk.")
+        Container(worker, "Queue Worker", "Python 3.12, arq, same backend codebase", "Consumes Redis queues: OCR, CSV, email, sync, webhook, AI job dispatch")
         ContainerDb(pg, "PostgreSQL", "PostgreSQL 16", "Primary data store with RLS for tenancy. Core tables, AI tables, Audit logs")
         ContainerDb(redis, "Redis", "Redis 7", "Job Queue (arq), Cache, Pub/Sub, Rate Limits")
         Container(s3, "Object Storage", "S3 / MinIO", "Invoice PDFs, OCR results, CSV uploads, Export files")
+    }
+
+    Container_Boundary(agents, "AI Agent Service (receivable-agents repo)") {
+        Container(lg_platform, "LangGraph Platform", "Python 3.12, LangGraph, langgraph-api", "Hosts LangGraph agent graphs: Collection Agent, Reply Classifier. Stateful, checkpointed.")
     }
 
     System_Ext(llm, "LLM / OCR APIs", "OpenAI Vision, GPT-4, Anthropic Claude")
@@ -120,28 +124,32 @@ C4Container
     Rel(api, pg, "Reads/Writes", "SQLAlchemy + asyncpg + RLS")
     Rel(api, redis, "Publishes jobs, caches", "Redis protocol")
     Rel(api, s3, "Stores/retrieves files", "S3 API")
-    Rel(api, llm, "OCR + LLM calls", "REST API")
+    Rel(api, llm, "OCR calls", "REST API")
+    Rel(api, lg_platform, "Invokes agent runs", "langgraph-sdk (HTTP)")
     Rel(worker, pg, "Reads/Writes", "SQLAlchemy + asyncpg + RLS")
     Rel(worker, redis, "Consumes jobs", "Redis protocol")
     Rel(worker, s3, "Reads files", "S3 API")
-    Rel(worker, llm, "OCR calls", "REST API")
+    Rel(worker, lg_platform, "Dispatches AI jobs", "langgraph-sdk (HTTP)")
+    Rel(lg_platform, llm, "LLM + embedding calls", "REST API")
+    Rel(lg_platform, pg, "Reads context data", "asyncpg (read-only)")
     Rel(hetzner, api, "Triggers cron endpoints", "HTTPS + secret")
 ```
 
 ### Container Summary
 
-| Container | Technology | Role | MVP? | Scales How |
-|-----------|------------|------|------|------------|
-| **Frontend SPA** | React 18 + TypeScript + TailwindCSS + Vite | User interface, all screens | Yes | CDN-served, stateless |
-| **Backend API** | Python 3.12 + FastAPI + SQLAlchemy + Pydantic | REST API, auth, business logic, webhook receiver, cron endpoints | Yes | Horizontal (stateless) |
-| **Queue Worker** | Python 3.12 + arq (same codebase, different entrypoint) | Async job consumers: OCR, CSV import, email, sync, webhook | Yes | Horizontal (competing consumers) |
-| **Hetzner Cron** | Hetzner Cron Jobs (external, managed) | Triggers scheduled HTTP endpoints at configured intervals | Yes | Managed, no scaling needed |
-| **PostgreSQL** | PostgreSQL 16 | Primary data store, RLS for tenancy | Yes | Vertical → read replicas |
-| **Redis** | Redis 7 (or Valkey) | Job queue (arq), cache, pub/sub, rate limits | Yes | Vertical → cluster |
-| **Object Storage** | MinIO (self-hosted) / AWS S3 | File storage (invoices, CSVs) | Yes | Managed, unlimited |
-| **Reverse Proxy** | Caddy or Fly Proxy | TLS termination, routing, rate limiting | Yes | Managed |
+| Container | Technology | Repo | Role | MVP? | Scales How |
+|-----------|------------|------|------|------|------------|
+| **Frontend SPA** | React 18 + TypeScript + TailwindCSS + Vite | `rcbl-frontend` | User interface, all screens | Yes | CDN-served, stateless |
+| **Backend API** | Python 3.12 + FastAPI + SQLAlchemy + Pydantic | `rcbl-backend` | REST API, auth, business logic, webhook receiver, cron endpoints | Yes | Horizontal (stateless) |
+| **Queue Worker** | Python 3.12 + arq (same backend codebase) | `rcbl-backend` | Async job consumers: OCR, CSV, email, sync, webhook, AI dispatch | Yes | Horizontal (competing consumers) |
+| **LangGraph Platform** | Python 3.12 + LangGraph + langgraph-api | `receivable-agents` | AI agent graphs (Collection, Reply Classifier), stateful agents | Post-MVP | Horizontal (independent) |
+| **Hetzner Cron** | Hetzner Cron Jobs (external, managed) | N/A | Triggers scheduled HTTP endpoints at configured intervals | Yes | Managed |
+| **PostgreSQL** | PostgreSQL 16 | N/A | Primary data store, RLS for tenancy | Yes | Vertical → read replicas |
+| **Redis** | Redis 7 (or Valkey) | N/A | Job queue (arq), cache, pub/sub, rate limits | Yes | Vertical → cluster |
+| **Object Storage** | MinIO (self-hosted) / AWS S3 | N/A | File storage (invoices, CSVs) | Yes | Managed, unlimited |
+| **Reverse Proxy** | Caddy or Fly Proxy | N/A | TLS termination, routing, rate limiting | Yes | Managed |
 
-> **Key simplification:** Since backend and AI are both Python, the AI agent module (LangGraph) lives **inside the same codebase**. For MVP it's simply not imported. Post-MVP it's activated via feature flags and can optionally be split into a separate process if scale demands it.
+> **Key architecture decision:** The AI agents live in a **separate repository** (`receivable-agents`) and are deployed as a **LangGraph Platform** service. The backend calls agents via the **`langgraph-sdk`** Python client over HTTP. This allows independent development, deployment, and scaling of the AI and backend components.
 
 ---
 
@@ -265,11 +273,11 @@ graph TB
     MODULES --> SHARED
 ```
 
-### 4.4 C3: AI Agent Module (Python / LangGraph -- same codebase)
+### 4.4 C3: AI Agent Service (receivable-agents repo -- LangGraph Platform)
 
 ```mermaid
 graph TB
-    subgraph AI_MODULE["AI Module (inside Backend codebase)<br/>src/ai/ -- imported only when feature flag is on"]
+    subgraph AGENT_SERVICE["receivable-agents repo<br/>Deployed as LangGraph Platform"]
         subgraph AGENTS["LangGraph Agents"]
             subgraph COLLECTION["Collection Agent (StateGraph)"]
                 OBS["observe"] --> ANA["analyze"] --> DEC["decide"]
@@ -294,6 +302,7 @@ graph TB
             PRED_PAY["predict_payment<br/>(XGBoost)"]
             SCORE_RISK["score_risk<br/>(XGBoost)"]
             FORECAST["forecast_cashflow<br/>(Monte Carlo)"]
+            DB_READ["db_read_context<br/>(read-only DB)"]
         end
 
         subgraph LLM_INFRA["LLM Infrastructure"]
@@ -303,11 +312,16 @@ graph TB
         end
     end
 
+    subgraph BACKEND["rcbl-backend"]
+        SDK_CLIENT["langgraph-sdk Client<br/>calls agent runs via HTTP"]
+    end
+
+    SDK_CLIENT -->|"HTTP (langgraph-sdk)"| AGENT_SERVICE
     AGENTS --> TOOLS
     TOOLS --> LLM_INFRA
 ```
 
-> **Key difference from v1:** The AI module is no longer a separate Python service. It shares the same DB connection, the same Redis client, the same service layer. No network hop. No separate deployment. The `src/ai/` package is simply not loaded when AI feature flags are off.
+> **Key difference from v2:** The AI module is now a **separate repository** (`receivable-agents`) deployed as a **LangGraph Platform** service. The backend communicates with it exclusively via the `langgraph-sdk` Python client. The agent service has its own DB connection (read-only to the shared PostgreSQL) and its own LLM credentials.
 
 ---
 
@@ -462,7 +476,7 @@ rcbl-backend/
 │   │   │   ├── dashboard.py
 │   │   │   ├── settings.py
 │   │   │   ├── cron.py                # /internal/cron/* endpoints (Hetzner calls these)
-│   │   │   └── ai_router.py           # /api/ai/* routes (Post-MVP)
+│   │   │   └── ai_router.py           # /api/ai/* routes (Post-MVP, calls agents via SDK)
 │   │   └── schemas/                   # Pydantic request/response models
 │   │       ├── invoice.py
 │   │       ├── customer.py
@@ -479,7 +493,8 @@ rcbl-backend/
 │   │   ├── reminder_service.py
 │   │   ├── payment_service.py
 │   │   ├── notification_service.py    # Email sending
-│   │   └── dashboard_service.py
+│   │   ├── dashboard_service.py
+│   │   └── ai_service.py             # Post-MVP: orchestrates calls to LangGraph Platform via SDK
 │   │
 │   ├── integrations/                  # Third-party adapters
 │   │   ├── __init__.py
@@ -496,7 +511,7 @@ rcbl-backend/
 │   │   ├── email_sender.py
 │   │   ├── sync_executor.py
 │   │   ├── webhook_processor.py
-│   │   └── ai_jobs.py                 # Post-MVP: AI agent queue handlers
+│   │   └── ai_jobs.py                 # Post-MVP: dispatches agent runs via langgraph-sdk
 │   │
 │   ├── db/                            # Database layer
 │   │   ├── __init__.py
@@ -522,7 +537,7 @@ rcbl-backend/
 │   │   ├── ocr_client.py             # httpx → OpenAI Vision / Textract
 │   │   ├── email_client.py           # aiosmtplib / SES SDK
 │   │   ├── s3_client.py              # aioboto3 / boto3
-│   │   └── llm_client.py             # litellm wrapper (Post-MVP)
+│   │   └── langgraph_client.py       # langgraph-sdk client (Post-MVP, calls agent service)
 │   │
 │   ├── core/                          # Cross-cutting concerns
 │   │   ├── __init__.py
@@ -531,45 +546,13 @@ rcbl-backend/
 │   │   ├── tenant.py                 # Tenant context manager
 │   │   └── feature_flags.py          # Feature flag checker
 │   │
-│   └── ai/                           # AI module (Post-MVP, same codebase)
-│       ├── __init__.py
-│       ├── agents/
-│       │   ├── collection_agent.py    # LangGraph Collection StateGraph
-│       │   ├── reply_classifier.py    # LangGraph Reply classifier
-│       │   └── nodes/                 # Individual graph nodes
-│       │       ├── observe.py
-│       │       ├── analyze.py
-│       │       ├── decide.py
-│       │       ├── act.py
-│       │       ├── escalate.py
-│       │       └── learn.py
-│       ├── tools/                     # LangGraph tools
-│       │   ├── db_tools.py
-│       │   ├── llm_tools.py
-│       │   └── prediction_tools.py
-│       ├── models/                    # ML models
-│       │   ├── payment_predictor.py
-│       │   ├── risk_scorer.py
-│       │   ├── cash_flow_forecaster.py
-│       │   └── model_store.py
-│       ├── prompts/                   # Prompt templates (YAML)
-│       │   ├── collection_friendly.yaml
-│       │   ├── collection_firm.yaml
-│       │   └── reply_classification.yaml
-│       └── llm/
-│           ├── gateway.py             # litellm LLM gateway
-│           ├── prompt_registry.py
-│           └── cost_tracker.py
+│   └── # NOTE: No src/ai/ directory -- all AI agent code lives in receivable-agents repo
 │
 ├── tests/
 │   ├── conftest.py
 │   ├── test_invoices.py
 │   ├── test_uploads.py
 │   └── ...
-│
-└── trained_models/                    # Serialized ML model files (Post-MVP)
-    ├── payment_predictor_v1.pkl
-    └── risk_scorer_v1.pkl
 ```
 
 ### 6.2 Request Lifecycle
@@ -606,8 +589,8 @@ graph TD
 | `python-multipart` | File upload handling |
 | `openpyxl` | XLSX parsing |
 | `langgraph` | AI agent framework (Post-MVP) |
-| `litellm` | Unified LLM API (Post-MVP) |
-| `scikit-learn` / `xgboost` | ML models (Post-MVP) |
+| `langgraph-sdk` | LangGraph Platform Python client (Post-MVP) |
+| `scikit-learn` / `xgboost` | ML models -- used in `receivable-agents` repo (Post-MVP) |
 | `pytest` + `pytest-asyncio` | Testing |
 | `ruff` | Linting + formatting |
 
@@ -840,47 +823,155 @@ arq src.worker.WorkerSettings
 
 ---
 
-## 9. AI Agent Architecture (LangGraph)
+## 9. AI Agent Architecture (LangGraph Platform -- Separate Repo)
 
-### 9.1 Why LangGraph
+### 9.1 Why LangGraph Platform (Separate Service)
 
-| Concern | LangGraph Advantage |
+| Concern | LangGraph Platform Advantage |
 |---------|-------------------|
-| **Stateful agents** | StateGraph persists conversation state across runs |
+| **Stateful agents** | StateGraph persists conversation state across runs via built-in checkpointing |
 | **Human-in-the-loop** | Built-in interrupt/resume for approval workflows |
 | **Branching logic** | Conditional edges for escalation/autonomous paths |
 | **Tool calling** | Native tool integration for DB queries, email, etc. |
-| **Checkpointing** | State can be saved/loaded from PostgreSQL |
+| **Checkpointing** | State saved/loaded from PostgreSQL (managed by LangGraph Platform) |
 | **Observability** | LangSmith integration for tracing and debugging |
+| **Independent deployment** | Agent code evolves on its own release cycle |
+| **Independent scaling** | Scale AI workloads without touching the backend |
+| **SDK communication** | Backend calls agents via `langgraph-sdk` (Python HTTP client) |
 
-### 9.2 Architecture: AI as a Module
+### 9.2 Architecture: AI as a Separate Service
 
 ```mermaid
 graph LR
-    subgraph PYTHON_APP["Single Python Codebase"]
+    subgraph BACKEND_REPO["rcbl-backend repo"]
         direction TB
         API["Backend API (FastAPI)<br/>- All CRUD<br/>- Auth + Tenancy<br/>- File storage<br/>- Email sending<br/>- Cron endpoints"]
-        AI["AI Module (src/ai/)<br/>- LangGraph agents<br/>- ML predictions<br/>- LLM gateway<br/>- Prompt management"]
-        WORKER["arq Worker<br/>- OCR, CSV, Email<br/>- AI job handlers"]
+        SDK["langgraph-sdk Client<br/>(src/clients/langgraph_client.py)<br/>- create_run()<br/>- wait_for_result()<br/>- stream_events()"]
+        WORKER["arq Worker<br/>- OCR, CSV, Email<br/>- AI job dispatch via SDK"]
     end
 
-    API -->|"imports"| AI
-    WORKER -->|"imports"| AI
-    API -->|"same DB, same Redis"| AI
+    subgraph AGENT_REPO["receivable-agents repo"]
+        direction TB
+        PLATFORM["LangGraph Platform<br/>(langgraph-api server)"]
+        AGENTS["Agent Graphs<br/>- Collection Agent<br/>- Reply Classifier"]
+        TOOLS["Tools + Models<br/>- LLM, Prediction<br/>- DB read-only"]
+    end
 
-    style AI fill:#f0f9ff,stroke:#3b82f6,stroke-width:2px
+    API --> SDK
+    WORKER --> SDK
+    SDK -->|"HTTP (langgraph-sdk)"| PLATFORM
+    PLATFORM --> AGENTS
+    AGENTS --> TOOLS
+
+    style AGENT_REPO fill:#f0f9ff,stroke:#3b82f6,stroke-width:2px
 ```
 
-Since the backend is Python and LangGraph is Python, there is **no cross-service boundary**. The AI module:
-- Shares the same SQLAlchemy session (same DB pool, same RLS)
-- Shares the same Redis connection (same arq queue)
-- Shares the same service layer (can call `invoice_service`, `customer_service` directly)
-- Is simply not imported when AI feature flags are disabled
+The backend and agents are **two separate Python codebases** in **two separate repositories**:
+- **`rcbl-backend`** -- owns all business logic, auth, tenancy, CRUD, jobs. Calls agents via `langgraph-sdk`.
+- **`receivable-agents`** -- owns all LangGraph agent graphs, ML models, LLM gateway, prompt templates. Deployed as a LangGraph Platform service.
 
-### 9.3 Collection Agent Graph (LangGraph)
+### 9.3 receivable-agents Repository Structure
+
+```
+receivable-agents/
+├── pyproject.toml                     # uv / poetry managed dependencies
+├── Dockerfile
+├── langgraph.json                     # LangGraph Platform config (graphs, env)
+│
+├── src/
+│   ├── agents/
+│   │   ├── collection_agent.py        # LangGraph Collection StateGraph
+│   │   ├── reply_classifier.py        # LangGraph Reply Classifier StateGraph
+│   │   └── nodes/                     # Individual graph nodes
+│   │       ├── observe.py
+│   │       ├── analyze.py
+│   │       ├── decide.py
+│   │       ├── act.py
+│   │       ├── escalate.py
+│   │       └── learn.py
+│   ├── tools/                         # LangGraph tools (DB read, LLM, predictions)
+│   │   ├── db_tools.py                # Read-only DB queries for context
+│   │   ├── llm_tools.py
+│   │   └── prediction_tools.py
+│   ├── models/                        # ML models
+│   │   ├── payment_predictor.py
+│   │   ├── risk_scorer.py
+│   │   ├── cash_flow_forecaster.py
+│   │   └── model_store.py
+│   ├── prompts/                       # Prompt templates (YAML)
+│   │   ├── collection_friendly.yaml
+│   │   ├── collection_firm.yaml
+│   │   └── reply_classification.yaml
+│   └── llm/
+│       ├── gateway.py                 # litellm LLM gateway
+│       ├── prompt_registry.py
+│       └── cost_tracker.py
+│
+├── trained_models/                    # Serialized ML model files
+│   ├── payment_predictor_v1.pkl
+│   └── risk_scorer_v1.pkl
+│
+└── tests/
+    ├── test_collection_agent.py
+    └── test_reply_classifier.py
+```
+
+### 9.4 Backend → Agent Communication via langgraph-sdk
+
+The backend calls the LangGraph Platform using the official `langgraph-sdk` Python client:
 
 ```python
-# src/ai/agents/collection_agent.py
+# rcbl-backend/src/clients/langgraph_client.py
+
+from langgraph_sdk import get_client
+from src.config import settings
+
+class AgentClient:
+    def __init__(self):
+        self.client = get_client(url=settings.LANGGRAPH_API_URL)
+
+    async def run_collection_agent(self, invoice_context: dict) -> dict:
+        """Invoke the collection agent graph and wait for result."""
+        thread = await self.client.threads.create()
+        run = await self.client.runs.create(
+            thread_id=thread["thread_id"],
+            assistant_id="collection_agent",
+            input=invoice_context,
+        )
+        # Wait for the run to complete
+        result = await self.client.runs.join(
+            thread_id=thread["thread_id"],
+            run_id=run["run_id"],
+        )
+        return result
+
+    async def run_reply_classifier(self, email_data: dict) -> dict:
+        """Invoke the reply classifier graph and wait for result."""
+        thread = await self.client.threads.create()
+        run = await self.client.runs.create(
+            thread_id=thread["thread_id"],
+            assistant_id="reply_classifier",
+            input=email_data,
+        )
+        result = await self.client.runs.join(
+            thread_id=thread["thread_id"],
+            run_id=run["run_id"],
+        )
+        return result
+
+    async def stream_agent_events(self, thread_id: str, run_id: str):
+        """Stream events from an agent run (for SSE to frontend)."""
+        async for event in self.client.runs.stream(
+            thread_id=thread_id,
+            run_id=run_id,
+        ):
+            yield event
+```
+
+### 9.5 Collection Agent Graph (in receivable-agents repo)
+
+```python
+# receivable-agents/src/agents/collection_agent.py
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -928,10 +1019,10 @@ checkpointer = PostgresSaver.from_conn_string(DATABASE_URL)
 collection_agent = graph.compile(checkpointer=checkpointer)
 ```
 
-### 9.4 Reply Classifier Graph
+### 9.6 Reply Classifier Graph (in receivable-agents repo)
 
 ```python
-# src/ai/agents/reply_classifier.py
+# receivable-agents/src/agents/reply_classifier.py
 
 graph = StateGraph(ReplyClassificationState)
 
@@ -956,10 +1047,10 @@ graph.add_conditional_edges("route_action", route_by_intent, {
 })
 ```
 
-### 9.5 LLM Gateway Pattern
+### 9.7 LLM Gateway Pattern (in receivable-agents repo)
 
 ```python
-# src/ai/llm/gateway.py
+# receivable-agents/src/llm/gateway.py
 from litellm import completion
 
 class LLMGateway:
@@ -1009,11 +1100,13 @@ graph TB
     subgraph POOLING["Connection Pooling"]
         API_POOL["Backend API: asyncpg pool<br/>(max 20 conns per instance)"]
         WORKER_POOL["Worker: asyncpg pool<br/>(max 10 conns per instance)"]
+        AGENT_POOL["Agent Service: asyncpg pool<br/>(max 5 conns, read-only)"]
         PGBOUNCER["Consider PgBouncer at<br/>50+ concurrent connections"]
     end
 
     API_POOL --> PRIMARY
     WORKER_POOL --> PRIMARY
+    AGENT_POOL --> PRIMARY
 ```
 
 ### 10.2 Schema Organization
@@ -1110,9 +1203,10 @@ baselineOnMigrate = true
 
 ```mermaid
 graph TB
-    subgraph DEPLOY["Deployment Topology (MVP)"]
-        API["Python Backend API<br/>(2 instances, uvicorn)"]
-        WORKER["Python arq Worker<br/>(1 instance)"]
+    subgraph DEPLOY["Deployment Topology (MVP + Post-MVP)"]
+        API["Python Backend API<br/>(2 instances, uvicorn)<br/>rcbl-backend repo"]
+        WORKER["Python arq Worker<br/>(1 instance)<br/>rcbl-backend repo"]
+        AGENT["LangGraph Platform<br/>(1 instance, Post-MVP)<br/>receivable-agents repo"]
 
         PG["Managed PostgreSQL<br/>(Neon / Supabase / Fly Postgres)"]
         REDIS["Managed Redis<br/>(Upstash / Fly Redis)"]
@@ -1124,9 +1218,12 @@ graph TB
     API --> PG
     API --> REDIS
     API --> OBJ
+    API -->|"langgraph-sdk"| AGENT
     WORKER --> PG
     WORKER --> REDIS
     WORKER --> OBJ
+    WORKER -->|"langgraph-sdk"| AGENT
+    AGENT -->|"read-only"| PG
     HETZNER -->|"HTTPS + secret"| API
 ```
 
@@ -1146,12 +1243,28 @@ services:
       S3_ENDPOINT: http://minio:9000
       CRON_SECRET: dev-secret-change-me
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      LANGGRAPH_API_URL: http://agent:8123  # Post-MVP: connect to agent service
 
   worker:
     build: ./rcbl-backend
     command: arq src.worker.WorkerSettings
     depends_on: [postgres, redis, minio]
-    environment: # same as api
+    environment:  # same as api
+      DATABASE_URL: postgresql+asyncpg://rcbl:rcbl@postgres:5432/rcbl
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      LANGGRAPH_API_URL: http://agent:8123
+
+  # Post-MVP: LangGraph Platform agent service (receivable-agents repo)
+  agent:
+    build: ./receivable-agents
+    command: langgraph up --host 0.0.0.0 --port 8123
+    ports: ["8123:8123"]
+    depends_on: [postgres]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rcbl:rcbl@postgres:5432/rcbl  # read-only access
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 
   frontend:
     build: ./rcbl-frontend
@@ -1206,11 +1319,11 @@ volumes:
 
 ```mermaid
 graph TD
-    A["PR Opened / Push to main"] --> B["Lint + Format<br/>ruff check, ruff format --check (backend)<br/>eslint, prettier (frontend)"]
-    B --> C["Unit Tests<br/>pytest (backend)<br/>vitest (frontend)"]
-    C --> D["Integration Tests<br/>Docker Compose + test DB<br/>API endpoint tests"]
-    D --> E["Build<br/>Docker images (backend, frontend)<br/>Frontend static build"]
-    E --> F["Deploy<br/>Fly deploy / Railway deploy<br/>Run flyway migrate<br/>Health check"]
+    A["PR Opened / Push to main"] --> B["Lint + Format<br/>ruff check, ruff format --check (backend)<br/>eslint, prettier (frontend)<br/>ruff check (agents)"]
+    B --> C["Unit Tests<br/>pytest (backend + agents)<br/>vitest (frontend)"]
+    C --> D["Integration Tests<br/>Docker Compose + test DB<br/>API endpoint tests<br/>Agent graph tests"]
+    D --> E["Build<br/>Docker images (backend, agents, frontend)<br/>Frontend static build"]
+    E --> F["Deploy<br/>Fly deploy / Railway deploy<br/>Run flyway migrate<br/>Deploy agent service<br/>Health check"]
 ```
 
 ---
@@ -1283,6 +1396,7 @@ Outbound webhooks (future):
 |--------|-----------|--------|
 | API p99 latency > 500ms | Sustained 5 min | Add API instance |
 | Worker queue depth > 100 | Sustained 10 min | Add Worker instance |
+| Agent p99 latency > 2s | Sustained 5 min | Add Agent instance |
 | PostgreSQL CPU > 70% | Sustained 15 min | Add read replica OR upgrade instance |
 | Redis memory > 80% | Sustained | Increase instance size OR add eviction policy |
 | OCR queue wait > 30s | Sustained | Increase OCR concurrency OR add Worker |
@@ -1304,7 +1418,7 @@ Outbound webhooks (future):
 ```
 - 3-4x Python API instances (1GB each)
 - 2x Python arq Worker instances (1GB each)
-- AI module activated (same codebase, no extra infra)
+- 1x LangGraph Platform (agent service, 1GB, receivable-agents repo)
 - 1x PostgreSQL (4GB RAM, 100GB) + 1x read replica
 - 1x Redis (512MB)
 - PgBouncer for connection pooling
@@ -1315,7 +1429,7 @@ Outbound webhooks (future):
 ```
 - 4-8x Python API (2GB each, behind load balancer)
 - 3-4x Python Workers (2GB each)
-- Optionally: split AI module into separate service for independent scaling
+- 2-4x LangGraph Platform instances (independently scaled)
 - PostgreSQL: Primary (8GB) + 2x read replicas
 - Redis Cluster (3 nodes)
 - CDN for frontend assets
@@ -1328,6 +1442,7 @@ Outbound webhooks (future):
 - **Frontend:** Static files on CDN, scales infinitely
 - **File Storage:** S3/MinIO is effectively unlimited
 - **Cron:** Hetzner handles scheduling; just one HTTP call per trigger
+- **Agent Service:** Not deployed in MVP; only added Post-MVP
 - **Database Writes:** PostgreSQL handles 10K+ writes/sec on modest hardware; not a concern until Phase 3
 
 ---
@@ -1341,8 +1456,8 @@ graph TB
     subgraph MVP["MVP Deployment (Weeks 1-8)"]
         direction LR
         M1["Frontend<br/>(React)"]
-        M2["Python API<br/>(FastAPI)"]
-        M3["Python Worker<br/>(arq)"]
+        M2["Python API<br/>(FastAPI)<br/>rcbl-backend"]
+        M3["Python Worker<br/>(arq)<br/>rcbl-backend"]
         M4["PostgreSQL"]
         M5["Redis"]
         M6["Hetzner Cron"]
@@ -1351,17 +1466,18 @@ graph TB
     subgraph POSTMVP["Post-MVP Deployment (Weeks 13+)"]
         direction LR
         P1["Frontend<br/>(React)"]
-        P2["Python API<br/>(FastAPI + AI module)"]
-        P3["Python Worker<br/>(arq + AI jobs)"]
-        P4["PostgreSQL<br/>+ Replica"]
-        P5["Redis"]
-        P6["Hetzner Cron<br/>(+ AI cron entries)"]
+        P2["Python API<br/>(FastAPI + SDK client)<br/>rcbl-backend"]
+        P3["Python Worker<br/>(arq + AI dispatch)<br/>rcbl-backend"]
+        P4["LangGraph Platform<br/>(Agent Service)<br/>receivable-agents"]
+        P5["PostgreSQL<br/>+ Replica"]
+        P6["Redis"]
+        P7["Hetzner Cron<br/>(+ AI cron entries)"]
     end
 ```
 
-> **MVP:** Same Python codebase, `src/ai/` is simply not imported. No LLM API keys needed. No ML model files. Just FastAPI + React + PostgreSQL + Redis + S3 + Hetzner Cron.
+> **MVP:** Backend and agents are separate repos, but only the backend is deployed for MVP. No LLM API keys needed. No agent service. Just FastAPI + React + PostgreSQL + Redis + S3 + Hetzner Cron.
 
-> **Post-MVP:** Enable feature flags, add LLM API keys to env, deploy trained model files. The same codebase now runs AI agents. Zero new services to deploy.
+> **Post-MVP:** Deploy the `receivable-agents` service alongside the backend. Enable feature flags, add LLM API keys, configure `LANGGRAPH_API_URL` in backend env. The backend now calls agents via SDK.
 
 ### 14.2 Feature Flag Gating
 
@@ -1376,10 +1492,10 @@ INSERT INTO feature_flags (flag_name, enabled, rollout_percentage) VALUES
 ('ai_message_generation', false, 0);
 ```
 
-The backend checks flags before running AI logic:
+The backend checks flags before calling the agent service:
 
 ```python
-# src/core/feature_flags.py
+# rcbl-backend/src/core/feature_flags.py
 async def is_enabled(flag_name: str, company_id: UUID, db: AsyncSession) -> bool:
     flag = await db.get(FeatureFlag, flag_name)
     if not flag or not flag.enabled:
@@ -1388,32 +1504,36 @@ async def is_enabled(flag_name: str, company_id: UUID, db: AsyncSession) -> bool
         return False
     return random.randint(1, 100) <= flag.rollout_percentage
 
-# Usage in router
+# Usage in router -- calls agent via langgraph-sdk
 @router.post("/api/ai/conversations/{id}/generate")
-async def generate_message(id: UUID, ...):
+async def generate_message(id: UUID, agent_client: AgentClient = Depends(get_agent_client), ...):
     if not await is_enabled("ai_message_generation", current_user.company_id, db):
         raise HTTPException(404, "Feature not available")
-    # ... run LangGraph agent
+    result = await agent_client.run_collection_agent(invoice_context)
+    return result
 ```
 
 ### 14.3 Code Organization for the Boundary
 
 ```
+# rcbl-backend repo (Backend)
 src/
-├── ai/                            # This entire package is Post-MVP
-│   ├── __init__.py                # Imports guarded by feature flag check
-│   ├── agents/                    # LangGraph graphs
-│   ├── tools/                     # Agent tools
-│   ├── models/                    # ML models
-│   ├── prompts/                   # Prompt templates
-│   └── llm/                       # LLM gateway
-│
-├── api/routers/ai_router.py       # AI endpoints, all gated by feature flags
-├── jobs/ai_jobs.py                # AI queue handlers, gated
+├── clients/langgraph_client.py    # SDK client to call agent service (Post-MVP)
+├── services/ai_service.py         # Orchestrates agent calls (Post-MVP)
+├── api/routers/ai_router.py       # AI endpoints, all gated by feature flags (Post-MVP)
+├── jobs/ai_jobs.py                # AI job dispatch via SDK (Post-MVP)
 └── ...                            # Everything else is MVP
+
+# receivable-agents repo (Agent Service -- entirely Post-MVP)
+src/
+├── agents/                        # LangGraph graphs
+├── tools/                         # Agent tools
+├── models/                        # ML models
+├── prompts/                       # Prompt templates
+└── llm/                           # LLM gateway
 ```
 
-The MVP deployment never touches `src/ai/` -- those modules are only imported when a feature flag is active for a specific tenant.
+The MVP deployment does not start the agent service at all. Post-MVP, enable the agent service and configure `LANGGRAPH_API_URL` in the backend.
 
 ---
 
@@ -1424,7 +1544,7 @@ The MVP deployment never touches `src/ai/` -- those modules are only imported wh
 **Decision:** Python 3.12 + FastAPI for backend API and worker.
 
 **Rationale:**
-- **Unified language with AI:** LangGraph, scikit-learn, XGBoost, litellm are all Python. One language = one codebase = one team
+- **Unified language with AI:** LangGraph, scikit-learn, XGBoost, litellm are all Python. Same language for backend and agent repos = shared skill set
 - **FastAPI performance:** Async-native, on par with Node.js for I/O-bound workloads (which this system is)
 - **Development speed:** Faster iteration than compiled languages; critical for MVP timeline
 - **Ecosystem depth:** Best-in-class libraries for OCR (OpenAI SDK), email (aiosmtplib), CSV (pandas), S3 (aioboto3)
@@ -1473,6 +1593,20 @@ The MVP deployment never touches `src/ai/` -- those modules are only imported wh
 
 **Trade-off:** Less feature-rich than Celery (no task chains, no canvas). Mitigated by: we don't need those features; our jobs are simple enqueue → process → done.
 
+### ADR-005: Separate Agent and Backend Repositories
+
+**Decision:** AI agents (`receivable-agents`) and backend (`rcbl-backend`) are separate repositories, communicating via `langgraph-sdk`.
+
+**Rationale:**
+- **Independent deployment:** Agent code can be deployed, rolled back, and versioned independently of the backend
+- **Independent scaling:** LangGraph Platform can be scaled based on AI workload without affecting the backend
+- **Team independence:** AI and backend teams can work on separate repos with separate CI/CD pipelines
+- **Clean separation of concerns:** Backend owns business logic, auth, tenancy; agents own AI graphs, prompts, ML models
+- **LangGraph Platform compatibility:** Deploying agents as a LangGraph Platform service gives built-in checkpointing, observability (LangSmith), and standard SDK communication
+- **Technology flexibility:** Agent repo can adopt different ML libraries, model versions, and LLM providers without touching backend
+
+**Trade-off:** Network hop between backend and agents adds latency (~10-50ms per call). Mitigated by: agent calls are inherently slow (LLM calls take 1-10s), so HTTP overhead is negligible. Also, the `langgraph-sdk` handles retries, timeouts, and streaming natively.
+
 ---
 
 ## Appendix B: Monitoring & Observability
@@ -1492,9 +1626,11 @@ The MVP deployment never touches `src/ai/` -- those modules are only imported wh
 | **Database** | Table sizes and growth | pg_stat_user_tables |
 | **Cron** | Hetzner job success/failure | Hetzner dashboard + alerts |
 | **Cron** | Endpoint response time | API metrics |
-| **AI Service** | LLM latency per model | Prometheus |
+| **AI Service** | LLM latency per model | LangSmith + Prometheus |
 | **AI Service** | LLM cost per tenant | Custom meter |
-| **AI Service** | Agent decision success rate | Custom meter |
+| **AI Service** | Agent decision success rate | LangSmith |
+| **AI Service** | Agent run duration (p50, p95) | Prometheus |
+| **AI Service** | langgraph-sdk call failures | Prometheus |
 | **Business** | OCR accuracy per tenant | Custom |
 | **Business** | Emails sent / delivered / opened | Custom |
 | **Business** | Sync success rate per provider | Custom |
@@ -1531,15 +1667,18 @@ The MVP deployment never touches `src/ai/` -- those modules are only imported wh
 | 1.1 | 2026-02-08 | Architecture Team | Converted all ASCII diagrams to Mermaid |
 | 2.0 | 2026-02-08 | Architecture Team | Switched backend from Rust to Python/FastAPI, replaced in-process cron with Hetzner Cron Jobs, merged AI service into same codebase as backend module, replaced Celery with arq, updated all diagrams/structures/ADRs |
 | 2.1 | 2026-02-08 | Architecture Team | Replaced Alembic with Flyway for database migrations (pure SQL, language-agnostic) |
+| 3.0 | 2026-02-15 | Architecture Team | Separated AI agents into independent `receivable-agents` repo, backend connects via `langgraph-sdk`. Agents deployed as LangGraph Platform service. Updated all diagrams, project structures, Docker Compose, deployment topology, scalability playbook, ADRs. Added ADR-005 for repo separation. |
 
 ---
 
 **Next Steps:**
 1. Review and approve architecture decisions (ADRs)
 2. Set up local development environment (Docker Compose)
-3. Create Python project scaffold with FastAPI + SQLAlchemy + arq
-4. Create React project scaffold with Vite + TailwindCSS
-5. Write initial Flyway SQL migrations (core tables + RLS)
-6. Implement auth flow (register/login/JWT)
-7. Configure Hetzner Cron Jobs for status updater + reminder sender
-8. Begin Sprint 1: Invoice upload + OCR integration
+3. Create `rcbl-backend` project scaffold with FastAPI + SQLAlchemy + arq
+4. Create `receivable-agents` project scaffold with LangGraph Platform
+5. Create React project scaffold with Vite + TailwindCSS
+6. Write initial Flyway SQL migrations (core tables + RLS)
+7. Implement auth flow (register/login/JWT)
+8. Configure Hetzner Cron Jobs for status updater + reminder sender
+9. Begin Sprint 1: Invoice upload + OCR integration
+10. Post-MVP: Deploy agent service, integrate `langgraph-sdk` in backend
