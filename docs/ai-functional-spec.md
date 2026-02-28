@@ -1,10 +1,30 @@
 # AI-Native Functional Specification
 ## Receivable Notification System - Enhanced Platform
 
-**Document Version:** 2.0  
-**Last Updated:** February 7, 2026  
+**Document Version:** 2.2  
+**Last Updated:** February 28, 2026  
 **Product Stage:** MVP + AI Enhancement Layer  
 **Dependencies:** Extends core MVP functionality as defined in `functional-spec.md`
+
+### Priority Definitions
+
+| Priority | Label | Meaning | Implementation Phase |
+|----------|-------|---------|---------------------|
+| **P0** | Critical | Must-have for MVP launch; blocks release | Phase 1-2 (Weeks 1-8) |
+| **P1** | Important | Should-have; significantly improves value | Phase 3-4 (Weeks 9-16) |
+| **P2** | Nice-to-have | Could-have; enhances experience but not critical | Phase 5+ (Weeks 17+) |
+
+### Key Thresholds & Defaults
+
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| AI Confidence Threshold | **70%** | Below this, AI requests human review |
+| OCR Processing Timeout | **30 seconds** | Max time for OCR including retries |
+| High-Risk Invoice Amount | **€10,000** | Amount above which requires extra approval |
+| Write-Off Approval Threshold | **€1,000** | Amount above which requires manager approval |
+| Max Bulk Upload Files | **20 files** | Per batch upload limit |
+| Max File Size | **10MB** | Per file upload limit |
+| Max Batch Size | **200MB** | Total size per batch upload |
 
 ---
 
@@ -192,13 +212,13 @@ User uploads file
 - Duplicate invoice number for same company → Show warning, allow override
 - Poor quality scan → Show warning, fall back to manual entry
 - Non-English invoice → Attempt extraction, flag low-confidence fields
-- OCR timeout (>15 seconds) → Show error, allow manual entry with retry option
+- OCR timeout (>30 seconds) → Show error, allow manual entry with retry option
 - Multi-page invoice → Process all pages, extract from first page primarily
 
 **Technical Requirements:**
 - Primary OCR: OpenAI Vision API (GPT-4 Vision) for structured extraction
 - Fallback OCR: AWS Textract or Google Cloud Vision API
-- Processing target: <10 seconds for typical single-page invoice
+- Processing target: <15 seconds for typical single-page invoice (30s timeout including retries)
 - Store OCR results with confidence scores in `ocr_extracted_data` JSONB
 - Cache OCR results for duplicate files (SHA-256 hash-based dedup)
 
@@ -217,9 +237,9 @@ User uploads file
 
 **Acceptance Criteria:**
 - Drag-and-drop zone accepts multiple files simultaneously
-- Upload limit: **up to 50 files per batch** (MVP)
+- Upload limit: **up to 20 files per batch** (MVP)
 - Supported formats: PDF, PNG, JPG, JPEG (same as single upload)
-- File size limit: 10MB per file, 200MB per batch
+- File size limit: 10MB per file, 200MB per batch total
 - On batch upload:
   1. System shows upload progress bar per file
   2. All files queued for parallel OCR processing
@@ -277,7 +297,6 @@ User drops 20 PDFs
 **Performance Requirements:**
 - Parallel OCR processing: up to 5 files concurrently
 - Batch of 20 invoices fully processed in < 3 minutes
-- Batch of 50 invoices fully processed in < 8 minutes
 - UI remains responsive during batch processing (async updates via WebSocket or polling)
 
 **Edge Cases:**
@@ -528,7 +547,7 @@ AccountingProvider {
 | Status 100 (Draft) | pending | |
 | Status 200 (Sent) | pending | |
 | Status 1000 (Paid) | paid | |
-| Status 1001 (Overdue) | overdue | |
+| (N/A) | overdue | **System-calculated**: Set when `due_date < NOW()` and status != 'paid'. SevDesk does not have explicit overdue status. |
 
 **Sync Configuration (User Settings):**
 - **Sync Direction:** Import only / Export only / Bidirectional (default)
@@ -720,8 +739,8 @@ The Autonomous Collection Agent (ACA) is an AI-powered system that manages the e
 │     └── Confidence level                                      │
 │                                                               │
 │  3. DECIDE                                                    │
-│     ├── If confidence > threshold → Act autonomously          │
-│     ├── If confidence < threshold → Request human review      │
+│     ├── If confidence > 70% → Act autonomously              │
+│     ├── If confidence < 70% → Request human review          │
 │     └── If high-risk action → Require human approval          │
 │                                                               │
 │  4. ACT                                                       │
@@ -864,6 +883,62 @@ Best regards,
 - Intent classification with confidence scores
 - Multi-language support (EN, DE, FR for V1)
 
+**Email Monitoring Architecture:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    EMAIL MONITORING ARCHITECTURE                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  OPTION A: Email Forwarding (Recommended for MVP)                    │
+│  ─────────────────────────────────────────────────────────────────  │
+│                                                                       │
+│  Customer replies to: collection@{company-slug}.receivable.app      │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │  Email Ingress Service (AWS SES / SendGrid Inbound Parse)      │ │
+│  │  - Receives email via webhook from email provider              │ │
+│  │  - Validates recipient domain and company slug                 │ │
+│  │  - Extracts: sender, subject, body, attachments               │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                          │                                           │
+│                          ▼                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │  Conversation Matching Service                                  │ │
+│  │  - Match by: sender email + recent outbound messages           │ │
+│  │  - Extract invoice number from subject/body if match fails     │ │
+│  │  - Create new conversation if no match (sales inquiry, etc.)   │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+│  OPTION B: IMAP Polling (Alternative)                                │
+│  ─────────────────────────────────────────────────────────────────  │
+│                                                                       │
+│  User connects existing inbox (Gmail, Outlook, etc.)                 │
+│  System polls inbox every 5 minutes via IMAP                         │
+│  Filters for messages matching sent-from domain                      │
+│  Lower reliability, more setup complexity                            │
+│                                                                       │
+│  OPTION C: BCC Tracking (Complementary)                             │
+│  ─────────────────────────────────────────────────────────────────  │
+│                                                                       │
+│  All outbound emails BCC: reply-tracking@{company-slug}.receivable.app │
+│  Customer replies include In-Reply-To header for matching            │
+│  Enables thread tracking regardless of which email customer replies to │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Technical Requirements for Email Monitoring:**
+- **Primary Method:** Email forwarding with custom subdomain per company
+- **DNS Configuration:** MX record for `*.receivable.app` → email provider
+- **Email Provider:** AWS SES (recommended) or SendGrid Inbound Parse
+- **Webhook Security:** HMAC signature validation on inbound webhooks
+- **Spam Filtering:** Basic spam detection, quarantine suspicious emails
+- **Attachment Handling:** Store attachments in S3, link to conversation
+- **Rate Limiting:** 100 emails/minute per company maximum
+- **Retention:** Email bodies stored for 7 years (audit compliance)
+
 #### 4.3.4 Automated Payment Plan Negotiation (Priority: P1)
 
 **User Story:** As a user, I want the AI to offer payment plan options when customers request them, within my pre-approved parameters.
@@ -1001,7 +1076,76 @@ IF PAYMENT PLAN NEEDED:
 - Bulk actions for similar cases
 - SLA tracking (escalations should be resolved within 24 hours)
 
-#### 4.3.7 Learning & Optimization (Priority: P1)
+#### 4.3.7 Invoice Write-Off Workflow (Priority: P2)
+
+**User Story:** As a user, I want a formal process for writing off uncollectible invoices so they are properly tracked for accounting purposes.
+
+**Write-Off Triggers:**
+
+| Trigger | Criteria | Automation Level |
+|---------|----------|------------------|
+| Extended overdue | > 90 days overdue, no response, low amount (< €500) | AI recommends, human approves |
+| Customer insolvency | Bankruptcy/insolvency detected or reported | Human-initiated, AI flags |
+| Dispute resolution | Dispute resolved in customer's favor | Human-initiated |
+| Collection agency return | Agency unable to collect | Human-initiated |
+| Small balance | Amount < €50, collection cost exceeds value | AI recommends, human approves |
+
+**Write-Off Workflow:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    WRITE-OFF WORKFLOW                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  1. INITIATION                                                │
+│     ├── AI recommends write-off based on criteria            │
+│     └── OR Human initiates from invoice actions menu          │
+│                                                               │
+│  2. REVIEW                                                    │
+│     ├── System shows write-off reason options                │
+│     ├── User selects reason:                                  │
+│     │   - Bad debt (uncollectible)                           │
+│     │   - Customer insolvency                                 │
+│     │   - Dispute resolution                                  │
+│     │   - Collection abandoned                                │
+│     │   - Small balance write-off                             │
+│     └── User can add notes for audit trail                   │
+│                                                               │
+│  3. APPROVAL (if required)                                    │
+│     ├── Invoices > €1,000 require manager approval           │
+│     ├── Invoices > €5,000 require finance approval           │
+│     └── Approval workflow configurable per company           │
+│                                                               │
+│  4. EXECUTION                                                 │
+│     ├── Invoice status → 'written_off'                       │
+│     ├── AI conversation status → 'completed', outcome → 'written_off' │
+│     ├── Create audit log entry                                │
+│     ├── Update customer risk score                            │
+│     └── Optional: Sync write-off to accounting system        │
+│                                                               │
+│  5. REPORTING                                                 │
+│     ├── Include in monthly write-off report                  │
+│     ├── Track total write-offs per period                    │
+│     └── Available for tax deduction documentation            │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Acceptance Criteria:**
+- Write-off option available in invoice actions menu
+- Write-off requires reason selection (mandatory)
+- Configurable approval thresholds based on amount
+- Full audit trail maintained
+- Write-offs included in company reporting
+- AI learns from write-off patterns to improve future predictions
+
+**Technical Requirements:**
+- Add `written_off` status to invoice status enum
+- Create `WriteOff` entity to track write-off details
+- Integration with accounting systems for bad debt recording
+- Tax reporting export (bad debt deduction documentation)
+
+#### 4.3.8 Learning & Optimization (Priority: P1)
 
 **User Story:** As a user, I want the AI to continuously improve based on outcomes.
 
@@ -1678,7 +1822,7 @@ channel: Enum (email, phone_script, linkedin)
 message_type: Enum (ai_generated, human_approved, human_written, customer_reply)
 content: Text
 subject: Text (nullable)
-sentiment_score: Decimal(3,2) (nullable, -1.0 to 1.0)
+sentiment_score: Decimal(4,3) (nullable, -1.000 to 1.000)
 intent_classification: String (nullable)
 confidence_score: Decimal(3,2) (nullable, 0.00 to 1.00)
 ai_reasoning: Text (nullable)
@@ -1854,7 +1998,7 @@ POST   /api/invoices/upload/item/:id/reject      - Reject single item
 # CSV Import
 POST   /api/invoices/import/csv                  - Upload CSV file
 POST   /api/invoices/import/csv/preview          - Preview CSV with column mapping
-POST   /api/invoices/import/csv/execute           - Execute CSV import with mappings
+POST   /api/invoices/import/csv/execute          - Execute CSV import with mappings
 GET    /api/invoices/import/csv/profiles          - List saved CSV profiles
 POST   /api/invoices/import/csv/profiles          - Save CSV mapping profile
 DELETE /api/invoices/import/csv/profiles/:id      - Delete CSV profile
@@ -1978,7 +2122,7 @@ GET    /api/ai/analytics/learning-events          - Learning signal summary
   6. Update item status to `ready` or `failed`
   7. If batch: check if all items processed, update batch status
   8. Send WebSocket/SSE notification to user
-- **Timeout:** 30 seconds per file
+- Timeout: 30 seconds per file (including retries)
 - **Error Handling:** Mark as failed, log error, allow manual retry
 
 #### CSV Import Processing Job
@@ -2099,7 +2243,7 @@ GET    /api/ai/analytics/learning-events          - Learning signal summary
 **Self-hosted Option:** PaddleOCR (for cost optimization at scale)
 
 **Requirements:**
-- <10 second processing for single-page invoice
+- <15 second processing for single-page invoice (30s timeout including retries)
 - Parallel processing support (up to 5 concurrent)
 - Structured output format (JSON) with confidence scores per field
 - Support for PDF, PNG, JPG, JPEG
@@ -2152,6 +2296,39 @@ GET    /api/ai/analytics/learning-events          - Learning signal summary
 - Automatic cleanup of orphaned files (weekly job)
 - Maximum storage per company: 10GB (MVP)
 
+**Storage Limit Overflow Handling:**
+
+| Usage Level | Action | User Experience |
+|-------------|--------|-----------------|
+| **< 70%** (7GB) | Normal operation | No intervention |
+| **70-85%** (7-8.5GB) | Warning banner in UI | "You're approaching storage limit. Consider upgrading or cleaning up old files."
+| **85-95%** (8.5-9.5GB) | Warning + email notification | In-app banner + email to admin users |
+| **95-100%** (9.5-10GB) | Soft limit warning | "Storage critically low. New uploads may fail soon."
+| **>= 100%** (10GB) | Hard limit enforcement | New uploads blocked; error message with upgrade prompt |
+
+**Storage Quota Enforcement:**
+
+```sql
+-- Check before upload
+SELECT 
+    c.id,
+    c.storage_quota_bytes,
+    COALESCE(SUM(f.file_size_bytes), 0) as used_bytes,
+    c.storage_quota_bytes - COALESCE(SUM(f.file_size_bytes), 0) as remaining_bytes
+FROM companies c
+LEFT JOIN invoice_upload_items f ON f.company_id = c.id
+WHERE c.id = :company_id
+GROUP BY c.id;
+
+-- Reject upload if remaining_bytes < file_size
+```
+
+**User Actions at Limit:**
+1. **Upgrade Plan** - Link to billing for higher tier
+2. **Delete Old Files** - Bulk delete UI for invoices > 2 years old
+3. **Archive to Cold Storage** - Move to cheaper S3 Glacier tier (V2 feature)
+4. **Export & Delete** - Download all files, then delete from system
+
 ### 9.6 Vector Database (Post-MVP, Optional)
 
 **Use Cases:** Customer communication embeddings, semantic search, similar customer situations
@@ -2199,6 +2376,116 @@ GET    /api/ai/analytics/learning-events          - Learning signal summary
 - Data portability: Standard export formats for migration
 - Third-party data processing: DPA (Data Processing Agreement) with all providers
 - Right to explanation: AI decisions are explainable (reasoning stored)
+
+### 10.5 Multi-Tenant Data Isolation
+
+The system enforces strict multi-tenant isolation using PostgreSQL Row-Level Security (RLS) to ensure complete data separation between companies.
+
+#### Isolation Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MULTI-TENANT ISOLATION FLOW                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  1. AUTHENTICATION                                                            │
+│     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                │
+│     │ API Request │────▶│ JWT Token   │────▶│ Extract     │                │
+│     │ w/ JWT      │     │ Validation  │     │ company_id  │                │
+│     └─────────────┘     └─────────────┘     └──────┬──────┘                │
+│                                                    │                          │
+│  2. CONTEXT SETTING                               ▼                          │
+│     ┌──────────────────────────────────────────────────────────────────┐    │
+│     │ SET app.current_company_id = '<company-uuid>';                   │    │
+│     │                                                                   │    │
+│     │ Middleware executes this on every authenticated database         │    │
+│     │ connection before any queries run.                                │    │
+│     └──────────────────────────────────────────────────────────────────┘    │
+│                                                                               │
+│  3. AUTOMATIC QUERY FILTERING (RLS)                                          │
+│     ┌──────────────────────────────────────────────────────────────────┐    │
+│     │ Application:  SELECT * FROM invoices;                             │    │
+│     │ PostgreSQL:   SELECT * FROM invoices                              │    │
+│     │               WHERE company_id = current_setting('app.company_id')│    │
+│     └──────────────────────────────────────────────────────────────────┘    │
+│                                                                               │
+│  4. GUARANTEE: Cross-company data access is impossible at database level    │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Tables with RLS Enabled
+
+| Table | Isolation Method | Notes |
+|-------|------------------|-------|
+| `users` | Direct (`company_id`) | Users belong to one company |
+| `customers` | Direct (`company_id`) | Customer records are company-scoped |
+| `invoices` | Direct (`company_id`) | Core business entity |
+| `reminder_sequences` | Direct (`company_id`) | Each company has own sequence |
+| `email_templates` | Direct (`company_id`) | Templates are company-specific |
+| `accounting_integrations` | Direct (`company_id`) | Integrations per company |
+| `cash_flow_forecasts` | Direct (`company_id`) | Forecasts per company |
+| `invoice_upload_batches` | Direct (`company_id`) | Upload sessions scoped |
+| `invoice_upload_items` | Direct (`company_id`) | Upload items scoped |
+| `csv_import_profiles` | Direct (`company_id`) | Import profiles per company |
+| `ai_conversations` | Inherited (via `invoices`) | Joins to invoices table |
+| `customer_risk_scores` | Inherited (via `customers`) | Joins to customers table |
+| `ai_messages` | Inherited (via `ai_conversations`) | Nested inheritance |
+| `ai_actions` | Inherited (via `ai_conversations`) | Nested inheritance |
+| `payments` | Inherited (via `invoices`) | Joins to invoices table |
+| `reminder_events` | Inherited (via `invoices`) | Joins to invoices table |
+
+#### Application Implementation Requirements
+
+**Middleware Pattern (Pseudocode):**
+```typescript
+// Express/Fastify middleware example
+async function setCompanyContext(req, res, next) {
+  const companyId = req.user.company_id; // From JWT token
+  
+  await db.query(`SET app.current_company_id = $1`, [companyId]);
+  
+  next();
+}
+
+// All subsequent queries on this connection are automatically scoped
+```
+
+**API Security Requirements:**
+- All authenticated endpoints must set `app.current_company_id` before queries
+- Unauthenticated endpoints (login, password reset) must NOT have access to RLS-protected tables
+- Connection pooling must ensure context is reset between requests
+- Background jobs must set company context before processing
+
+**Background Job Pattern:**
+```typescript
+// For async jobs that process company data
+async function processReminders(companyId: string) {
+  await db.query(`SET app.current_company_id = $1`, [companyId]);
+  // Now all queries are scoped to this company
+  const overdueInvoices = await db.query('SELECT * FROM invoices WHERE status = $1', ['overdue']);
+  // ...
+}
+```
+
+#### Security Guarantees
+
+| Scenario | Protection |
+|----------|------------|
+| Developer forgets WHERE clause | RLS filters automatically |
+| SQL injection attempt | RLS applies to injected queries too |
+| Direct database access | RLS still enforced |
+| Connection hijacking | Context scoped to connection |
+| Cross-company API request | JWT company_id doesn't match → no data returned |
+
+#### Compliance Considerations
+
+- **SOC 2:** RLS provides logical separation for multi-tenant environments
+- **GDPR:** Data isolation supports right to deletion per company
+- **Audit:** All RLS-protected queries are scoped to one company for traceability
+- **Penetration Testing:** RLS is tested as part of security review
+
+> **Note:** Detailed RLS implementation and policies are defined in [data-model.md](data-model.md) under "Production Readiness Recommendations > Security Enhancements".
 
 ---
 
@@ -2361,6 +2648,8 @@ GET    /api/ai/analytics/learning-events          - Learning signal summary
 |---------|------|--------|---------|
 | 1.0 | 2026-01-25 | AI Product Team | Initial AI-native specification |
 | 2.0 | 2026-02-07 | Product Team | Added Invoice Ingestion Hub (single, bulk, CSV), Third-Party Accounting Integration module (SevDesk, Xero, LexOffice, webhook), restructured for MVP-first approach, fixed section numbering, updated data model with ingestion entities, revised roadmap and success metrics |
+| 2.1 | 2026-02-28 | Product Team | Fixed OCR timeout inconsistencies (standardized to 15s processing, 30s timeout), fixed bulk upload limits (20 files, 200MB total), clarified SevDesk overdue status as system-calculated, added Invoice Write-Off Workflow (section 4.3.7), added Email Monitoring Architecture with three implementation options, fixed API path typo and sentiment_score precision (Decimal 4,3), added Priority Definitions and Key Thresholds table, added Storage Limit Overflow Handling with quota enforcement, synced with data-model.md v1.1 |
+| 2.2 | 2026-02-28 | Product Team | Added Section 10.5 Multi-Tenant Data Isolation with RLS architecture diagram, complete table coverage list, application implementation patterns (middleware, background jobs), security guarantees, and compliance considerations. Aligned with data-model.md RLS documentation. |
 
 ---
 

@@ -1,8 +1,8 @@
 # Data Model - Receivable Notification System
 ## PostgreSQL Database Schema
 
-**Version:** 1.0  
-**Last Updated:** January 25, 2026  
+**Version:** 1.1  
+**Last Updated:** February 28, 2026  
 **Database:** PostgreSQL 14+  
 **Purpose:** Complete data model for AI-Native Receivable Notification System
 
@@ -31,11 +31,13 @@ CREATE TABLE companies (
     default_payment_terms INTEGER NOT NULL DEFAULT 30,
     default_currency CHAR(3) NOT NULL DEFAULT 'EUR',
     eu_regulation_enabled BOOLEAN DEFAULT false,
+    storage_quota_bytes BIGINT DEFAULT 10737418240, -- 10GB default
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     
     CONSTRAINT valid_currency CHECK (default_currency ~ '^[A-Z]{3}$'),
-    CONSTRAINT valid_payment_terms CHECK (default_payment_terms > 0 AND default_payment_terms <= 365)
+    CONSTRAINT valid_payment_terms CHECK (default_payment_terms > 0 AND default_payment_terms <= 365),
+    CONSTRAINT valid_storage_quota CHECK (storage_quota_bytes > 0)
 );
 
 CREATE INDEX idx_companies_slug ON companies(slug);
@@ -115,18 +117,28 @@ CREATE TABLE invoices (
     invoice_date DATE NOT NULL,
     payment_terms_days INTEGER NOT NULL DEFAULT 30,
     due_date DATE NOT NULL,
-    status VARCHAR(20) NOT NULL CHECK (status IN ('pending', 'due_soon', 'overdue', 'paid')),
+    status VARCHAR(20) NOT NULL CHECK (status IN ('pending', 'due_soon', 'overdue', 'paid', 'written_off')),
     file_url TEXT,
     last_reminder_date TIMESTAMPTZ,
     next_action_date TIMESTAMPTZ,
     reminder_sequence_step INTEGER DEFAULT 0,
     
+    -- Source tracking
+    source VARCHAR(30) NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'upload', 'bulk_upload', 'csv_import', 'api_sync', 'email_forward', 'webhook')),
+    
     -- OCR fields
     ocr_processed BOOLEAN DEFAULT false,
     ocr_confidence_score DECIMAL(3,2) CHECK (ocr_confidence_score >= 0 AND ocr_confidence_score <= 1),
     ocr_extracted_data JSONB,
+    upload_item_id UUID, -- FK to invoice_upload_items
     
-    -- Integration fields
+    -- External integration fields (generalized)
+    external_id VARCHAR(100), -- ID in external system
+    external_provider VARCHAR(50), -- 'sevdesk', 'xero', 'lexoffice', etc.
+    external_synced_at TIMESTAMPTZ,
+    external_sync_status VARCHAR(20) DEFAULT 'not_synced' CHECK (external_sync_status IN ('not_synced', 'synced', 'sync_failed')),
+    
+    -- Legacy SevDesk fields (kept for backward compatibility)
     sevdesk_invoice_id VARCHAR(100),
     sevdesk_synced_at TIMESTAMPTZ,
     sevdesk_sync_status VARCHAR(20) DEFAULT 'not_synced' CHECK (sevdesk_sync_status IN ('not_synced', 'synced', 'sync_failed')),
@@ -152,10 +164,12 @@ CREATE INDEX idx_invoices_company_id ON invoices(company_id);
 CREATE INDEX idx_invoices_customer_id ON invoices(customer_id);
 CREATE INDEX idx_invoices_status ON invoices(status);
 CREATE INDEX idx_invoices_due_date ON invoices(due_date);
-CREATE INDEX idx_invoices_sevdesk_id ON invoices(sevdesk_invoice_id);
+CREATE INDEX idx_invoices_external_id ON invoices(external_provider, external_id);
+CREATE INDEX idx_invoices_source ON invoices(source);
 CREATE INDEX idx_invoices_next_action ON invoices(next_action_date) WHERE status != 'paid';
 CREATE INDEX idx_invoices_payment_prob ON invoices(payment_probability_7d, payment_probability_30d);
 CREATE INDEX idx_invoices_ai_conversation ON invoices(ai_conversation_id);
+CREATE INDEX idx_invoices_upload_item ON invoices(upload_item_id);
 ```
 
 ### Payment
@@ -237,6 +251,99 @@ CREATE TABLE email_templates (
 CREATE INDEX idx_email_templates_company_id ON email_templates(company_id);
 ```
 
+### InvoiceUploadBatch
+Tracks bulk invoice upload sessions.
+
+```sql
+CREATE TABLE invoice_upload_batches (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    upload_type VARCHAR(20) NOT NULL CHECK (upload_type IN ('single', 'bulk', 'csv_import')),
+    total_files INTEGER DEFAULT 0,
+    processed_files INTEGER DEFAULT 0,
+    successful_files INTEGER DEFAULT 0,
+    failed_files INTEGER DEFAULT 0,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('uploading', 'processing', 'review_pending', 'completed', 'failed')),
+    metadata JSONB, -- Stores column mappings for CSV, etc.
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_invoice_upload_batches_company_id ON invoice_upload_batches(company_id);
+CREATE INDEX idx_invoice_upload_batches_status ON invoice_upload_batches(status);
+CREATE INDEX idx_invoice_upload_batches_created_at ON invoice_upload_batches(created_at);
+```
+
+### InvoiceUploadItem
+Individual files within an upload batch.
+
+```sql
+CREATE TABLE invoice_upload_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    batch_id UUID NOT NULL REFERENCES invoice_upload_batches(id) ON DELETE CASCADE,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    file_name VARCHAR(500) NOT NULL,
+    file_url TEXT NOT NULL, -- S3/MinIO path
+    file_hash VARCHAR(64), -- SHA-256 for dedup
+    file_size_bytes BIGINT,
+    status VARCHAR(20) NOT NULL CHECK (status IN ('queued', 'processing', 'ready', 'review_pending', 'accepted', 'rejected', 'failed')),
+    ocr_confidence_score DECIMAL(3,2) CHECK (ocr_confidence_score >= 0 AND ocr_confidence_score <= 1),
+    ocr_extracted_data JSONB,
+    ocr_processing_time_ms INTEGER,
+    error_message TEXT,
+    invoice_id UUID REFERENCES invoices(id), -- Set after acceptance
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_invoice_upload_items_batch_id ON invoice_upload_items(batch_id);
+CREATE INDEX idx_invoice_upload_items_status ON invoice_upload_items(status);
+CREATE INDEX idx_invoice_upload_items_file_hash ON invoice_upload_items(file_hash);
+CREATE INDEX idx_invoice_upload_items_company_id ON invoice_upload_items(company_id);
+```
+
+### CSVImportProfile
+Saved column mapping profiles for CSV imports.
+
+```sql
+CREATE TABLE csv_import_profiles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    profile_name VARCHAR(255) NOT NULL,
+    column_mapping JSONB NOT NULL,
+    date_format VARCHAR(50),
+    number_format VARCHAR(50),
+    delimiter VARCHAR(10) DEFAULT ',',
+    encoding VARCHAR(20) DEFAULT 'utf-8',
+    last_used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_csv_import_profiles_company_id ON csv_import_profiles(company_id);
+```
+
+### WebhookEvent
+Incoming webhook events from external systems.
+
+```sql
+CREATE TABLE webhook_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    integration_id UUID REFERENCES accounting_integrations(id) ON DELETE CASCADE,
+    event_type VARCHAR(50) NOT NULL CHECK (event_type IN ('invoice_created', 'invoice_updated', 'payment_received', 'contact_updated')),
+    payload JSONB NOT NULL,
+    processing_status VARCHAR(20) NOT NULL CHECK (processing_status IN ('received', 'processing', 'processed', 'failed')),
+    error_message TEXT,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_webhook_events_integration_id ON webhook_events(integration_id);
+CREATE INDEX idx_webhook_events_status ON webhook_events(processing_status);
+CREATE INDEX idx_webhook_events_received_at ON webhook_events(received_at);
+```
+
 ### AccountingIntegration
 Integration configurations for external accounting systems.
 
@@ -244,23 +351,30 @@ Integration configurations for external accounting systems.
 CREATE TABLE accounting_integrations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-    provider VARCHAR(50) NOT NULL CHECK (provider IN ('sevdesk', 'xero', 'lexoffice')),
+    provider VARCHAR(50) NOT NULL CHECK (provider IN ('sevdesk', 'xero', 'lexoffice', 'quickbooks', 'custom_webhook')),
+    display_name VARCHAR(255),
     access_token TEXT NOT NULL,
     refresh_token TEXT,
     token_expires_at TIMESTAMPTZ,
+    webhook_url TEXT, -- For custom_webhook provider
+    webhook_api_key TEXT, -- API key for webhook authentication
     sync_direction VARCHAR(20) NOT NULL CHECK (sync_direction IN ('import', 'export', 'bidirectional')),
     auto_sync_enabled BOOLEAN DEFAULT false,
+    auto_sync_interval VARCHAR(20) DEFAULT 'daily' CHECK (auto_sync_interval IN ('hourly', 'daily', 'weekly')),
     auto_sync_time TIME DEFAULT '02:00:00',
     last_sync_at TIMESTAMPTZ,
     last_sync_status VARCHAR(20) CHECK (last_sync_status IN ('success', 'failed', 'partial')),
     last_sync_error TEXT,
     sync_config JSONB,
+    field_mapping_overrides JSONB, -- Custom field mappings per provider
+    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'disconnected', 'error')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_accounting_integrations_company_id ON accounting_integrations(company_id);
 CREATE INDEX idx_accounting_integrations_provider ON accounting_integrations(provider);
+CREATE INDEX idx_accounting_integrations_status ON accounting_integrations(status);
 ```
 
 ### SyncLog
@@ -332,7 +446,7 @@ CREATE TABLE ai_messages (
     message_type VARCHAR(30) NOT NULL CHECK (message_type IN ('ai_generated', 'human_approved', 'human_written', 'customer_reply')),
     content TEXT NOT NULL,
     subject TEXT,
-    sentiment_score DECIMAL(3,2) CHECK (sentiment_score >= -1 AND sentiment_score <= 1),
+    sentiment_score DECIMAL(4,3) CHECK (sentiment_score >= -1 AND sentiment_score <= 1),
     intent_classification VARCHAR(100),
     confidence_score DECIMAL(3,2) CHECK (confidence_score >= 0 AND confidence_score <= 1),
     ai_reasoning TEXT,
@@ -486,6 +600,8 @@ erDiagram
     companies ||--o{ email_templates : "has"
     companies ||--o{ accounting_integrations : "has"
     companies ||--o{ cash_flow_forecasts : "has"
+    companies ||--o{ invoice_upload_batches : "has"
+    companies ||--o{ csv_import_profiles : "has"
     
     customers ||--o{ invoices : "has"
     customers ||--o{ ai_conversations : "has"
@@ -496,6 +612,9 @@ erDiagram
     invoices ||--o{ ai_conversations : "manages"
     invoices ||--o{ payment_predictions : "predicts"
     
+    invoice_upload_batches ||--o{ invoice_upload_items : "contains"
+    invoice_upload_items ||--o| invoices : "creates"
+    
     ai_conversations ||--o{ ai_messages : "contains"
     ai_conversations ||--o{ ai_actions : "proposes"
     ai_conversations ||--o{ ai_learning_events : "generates"
@@ -503,8 +622,10 @@ erDiagram
     ai_actions ||--o{ ai_learning_events : "creates"
     
     accounting_integrations ||--o{ sync_logs : "logs"
+    accounting_integrations ||--o{ webhook_events : "receives"
     
     users ||--o{ ai_actions : "reviews"
+    users ||--o{ invoice_upload_batches : "creates"
 ```
 
 ### Relationship Summary
@@ -518,6 +639,8 @@ erDiagram
 | companies | email_templates | 1:N | CASCADE |
 | companies | accounting_integrations | 1:N | CASCADE |
 | companies | cash_flow_forecasts | 1:N | CASCADE |
+| companies | invoice_upload_batches | 1:N | CASCADE |
+| companies | csv_import_profiles | 1:N | CASCADE |
 | customers | invoices | 1:N | RESTRICT |
 | customers | ai_conversations | 1:N | RESTRICT |
 | customers | customer_risk_scores | 1:N | CASCADE |
@@ -525,12 +648,16 @@ erDiagram
 | invoices | reminder_events | 1:N | CASCADE |
 | invoices | ai_conversations | 1:1 | CASCADE |
 | invoices | payment_predictions | 1:N | CASCADE |
+| invoice_upload_batches | invoice_upload_items | 1:N | CASCADE |
+| invoice_upload_items | invoices | 1:1 | SET NULL |
 | ai_conversations | ai_messages | 1:N | CASCADE |
 | ai_conversations | ai_actions | 1:N | CASCADE |
 | ai_conversations | ai_learning_events | 1:N | CASCADE |
 | ai_actions | ai_learning_events | 1:N | CASCADE |
 | accounting_integrations | sync_logs | 1:N | CASCADE |
+| accounting_integrations | webhook_events | 1:N | CASCADE |
 | users | ai_actions | 1:N | SET NULL |
+| users | invoice_upload_batches | 1:N | SET NULL |
 
 ---
 
@@ -573,19 +700,85 @@ All critical business rules are enforced through database constraints:
 
 ### 1. **Security Enhancements**
 
-#### Missing: Row-Level Security (RLS)
-```sql
--- Enable RLS for multi-tenant isolation
-ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
-ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
-ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+#### Row-Level Security (RLS) for Multi-Tenant Isolation
 
--- Example policy
-CREATE POLICY company_isolation_policy ON invoices
+```sql
+-- Enable RLS on all company-scoped tables
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reminder_sequences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE email_templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE accounting_integrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cash_flow_forecasts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoice_upload_batches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoice_upload_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE csv_import_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_conversations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customer_risk_scores ENABLE ROW LEVEL SECURITY;
+
+-- Create RLS policies for each table
+-- Note: Application must set app.current_company_id on each connection
+
+CREATE POLICY users_company_isolation ON users
     USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY customers_company_isolation ON customers
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY invoices_company_isolation ON invoices
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY reminder_sequences_company_isolation ON reminder_sequences
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY email_templates_company_isolation ON email_templates
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY accounting_integrations_company_isolation ON accounting_integrations
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY cash_flow_forecasts_company_isolation ON cash_flow_forecasts
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY invoice_upload_batches_company_isolation ON invoice_upload_batches
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY invoice_upload_items_company_isolation ON invoice_upload_items
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+CREATE POLICY csv_import_profiles_company_isolation ON csv_import_profiles
+    USING (company_id = current_setting('app.current_company_id')::UUID);
+
+-- AI conversations inherit company isolation through invoices
+CREATE POLICY ai_conversations_company_isolation ON ai_conversations
+    USING (invoice_id IN (
+        SELECT id FROM invoices 
+        WHERE company_id = current_setting('app.current_company_id')::UUID
+    ));
+
+CREATE POLICY customer_risk_scores_company_isolation ON customer_risk_scores
+    USING (customer_id IN (
+        SELECT id FROM customers 
+        WHERE company_id = current_setting('app.current_company_id')::UUID
+    ));
+
+-- Application-level hook to set company context
+-- Execute on each authenticated request:
+-- SET app.current_company_id = 'uuid-of-current-user-company';
 ```
 
-#### Missing: Encryption at Rest
+**RLS Application Pattern:**
+```sql
+-- In application code, set context before queries:
+-- PostgreSQL connection initialization:
+-- 1. Authenticate user
+-- 2. Get user's company_id
+-- 3. Execute: SET app.current_company_id = '<company-uuid>';
+-- 4. All subsequent queries are automatically scoped
+```
+
+#### Encryption at Rest
 - **Recommendation:** Encrypt sensitive fields using `pgcrypto`
 - Fields to encrypt: `password_hash`, `access_token`, `refresh_token`
 
@@ -597,7 +790,7 @@ ALTER TABLE accounting_integrations
     ALTER COLUMN access_token TYPE BYTEA USING pgp_sym_encrypt(access_token, current_setting('app.encryption_key'));
 ```
 
-#### Missing: Audit Trail
+#### Audit Trail
 ```sql
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -619,7 +812,7 @@ CREATE INDEX idx_audit_logs_changed_by ON audit_logs(changed_by);
 
 ### 2. **Data Integrity Enhancements**
 
-#### Missing: Soft Deletes
+#### Soft Deletes
 ```sql
 -- Add to all major tables
 ALTER TABLE customers ADD COLUMN deleted_at TIMESTAMPTZ;
@@ -631,7 +824,7 @@ CREATE INDEX idx_customers_active ON customers(company_id) WHERE deleted_at IS N
 CREATE INDEX idx_invoices_active ON invoices(company_id, status) WHERE deleted_at IS NULL;
 ```
 
-#### Missing: Optimistic Locking
+#### Optimistic Locking
 ```sql
 -- Add version columns for concurrent update protection
 ALTER TABLE invoices ADD COLUMN version INTEGER DEFAULT 1;
@@ -645,7 +838,7 @@ ALTER TABLE customers ADD COLUMN version INTEGER DEFAULT 1;
 
 ### 3. **Performance Enhancements**
 
-#### Missing: Partitioning Strategy
+#### Partitioning Strategy
 ```sql
 -- Partition historical tables by date
 CREATE TABLE reminder_events_2026_q1 PARTITION OF reminder_events
@@ -659,7 +852,7 @@ CREATE TABLE ai_messages_2026_01 PARTITION OF ai_messages
     FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
 ```
 
-#### Missing: Materialized Views for Analytics
+#### Materialized Views for Analytics
 ```sql
 -- Customer payment behavior summary
 CREATE MATERIALIZED VIEW customer_payment_stats AS
@@ -686,7 +879,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY customer_payment_stats;
 
 ### 4. **Data Validation Enhancements**
 
-#### Missing: Advanced Business Rules
+#### Advanced Business Rules
 ```sql
 -- Ensure payment doesn't exceed invoice amount
 CREATE OR REPLACE FUNCTION validate_payment_amount()
@@ -707,7 +900,7 @@ CREATE TRIGGER check_payment_amount
     FOR EACH ROW EXECUTE FUNCTION validate_payment_amount();
 ```
 
-#### Missing: Data Quality Constraints
+#### Data Quality Constraints
 ```sql
 -- Ensure invoice date is not in future
 ALTER TABLE invoices ADD CONSTRAINT invoice_date_not_future 
@@ -724,7 +917,7 @@ ALTER TABLE payments ADD CONSTRAINT payment_after_invoice
 
 ### 5. **Monitoring & Observability**
 
-#### Missing: Statistics Tables
+#### Statistics Tables
 ```sql
 CREATE TABLE system_metrics (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -739,7 +932,7 @@ CREATE INDEX idx_system_metrics_name_date ON system_metrics(metric_name, recorde
 CREATE INDEX idx_system_metrics_company ON system_metrics(company_id, recorded_at);
 ```
 
-#### Missing: Health Check View
+#### Health Check View
 ```sql
 CREATE VIEW system_health AS
 SELECT 
@@ -762,7 +955,7 @@ WHERE status = 'active';
 
 ### 6. **Disaster Recovery**
 
-#### Missing: Point-in-Time Recovery Setup
+#### Point-in-Time Recovery Setup
 ```sql
 -- Enable continuous archiving
 -- Add to postgresql.conf:
@@ -771,7 +964,7 @@ WHERE status = 'active';
 -- archive_command = 'cp %p /archive/%f'
 ```
 
-#### Missing: Backup Metadata
+#### Backup Metadata
 ```sql
 CREATE TABLE backup_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -787,7 +980,7 @@ CREATE TABLE backup_history (
 
 ### 7. **Scalability Considerations**
 
-#### Missing: Connection Pooling Configuration
+#### Connection Pooling Configuration
 ```sql
 -- Add connection pooling limits
 -- Recommended: Use PgBouncer or connection pooling in application
@@ -803,7 +996,7 @@ FROM pg_stat_activity
 GROUP BY datname, usename;
 ```
 
-#### Missing: Auto-vacuum Tuning
+#### Auto-vacuum Tuning
 ```sql
 -- Adjust autovacuum for high-traffic tables
 ALTER TABLE invoices SET (autovacuum_vacuum_scale_factor = 0.05);
@@ -813,7 +1006,7 @@ ALTER TABLE payments SET (autovacuum_vacuum_scale_factor = 0.1);
 
 ### 8. **Compliance & GDPR**
 
-#### Missing: Data Retention Policies
+#### Data Retention Policies
 ```sql
 CREATE TABLE data_retention_policies (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -829,7 +1022,7 @@ INSERT INTO data_retention_policies (table_name, retention_days, deletion_logic)
 VALUES ('reminder_events', 730, 'DELETE FROM reminder_events WHERE sent_at < NOW() - INTERVAL ''730 days''');
 ```
 
-#### Missing: Personal Data Inventory
+#### Personal Data Inventory
 ```sql
 CREATE TABLE personal_data_fields (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -844,7 +1037,7 @@ CREATE TABLE personal_data_fields (
 
 ### 9. **API Rate Limiting**
 
-#### Missing: Rate Limit Tracking
+#### Rate Limit Tracking
 ```sql
 CREATE TABLE api_rate_limits (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -861,7 +1054,7 @@ CREATE INDEX idx_api_rate_limits_company_window ON api_rate_limits(company_id, w
 
 ### 10. **Feature Flags & A/B Testing**
 
-#### Missing: Feature Flag System
+#### Feature Flag System
 ```sql
 CREATE TABLE feature_flags (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
