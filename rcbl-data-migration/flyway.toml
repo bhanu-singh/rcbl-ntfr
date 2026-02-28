@@ -1,0 +1,34 @@
+[flyway]
+# Database connection — override with environment variables or .env file
+url      = "${FLYWAY_URL}"
+user     = "${FLYWAY_USER}"
+password = "${FLYWAY_PASSWORD}"
+
+# Migration source
+locations = ["filesystem:./migrations"]
+
+# Schema to manage
+schemas = ["public"]
+
+# Create the flyway_schema_history table automatically on first run
+baselineOnMigrate = true
+baselineVersion   = "0"
+
+# Fail fast on missing migrations (prevents accidental out-of-order runs)
+outOfOrder = false
+
+# Default encoding for migration scripts
+encoding = "UTF-8"
+
+# Validate applied migrations against local files before migrating
+validateOnMigrate = true
+
+# Allow mixed versioned and repeatable migrations
+mixed = false
+
+# Placeholder replacement — use ${VAR} syntax in SQL files
+placeholderReplacement = true
+
+[flyway.placeholders]
+# App role used at runtime (set by application connection pool)
+app_role = "rcbl_app"

@@ -1,0 +1,149 @@
+services:
+
+  # ── Infrastructure ───────────────────────────────────────────────────────────
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rcbl_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rcbl_admin
+      POSTGRES_PASSWORD: rcbl_secret
+      POSTGRES_DB: rcbl
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rcbl_admin -d rcbl"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  flyway:
+    image: flyway/flyway:10
+    container_name: rcbl_flyway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./rcbl-data-migration/migrations:/flyway/sql
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/rcbl
+      FLYWAY_USER: rcbl_admin
+      FLYWAY_PASSWORD: rcbl_secret
+      FLYWAY_BASELINE_ON_MIGRATE: "true"
+      FLYWAY_BASELINE_VERSION: "0"
+      FLYWAY_VALIDATE_ON_MIGRATE: "true"
+      FLYWAY_OUT_OF_ORDER: "false"
+    command: migrate
+
+  redis:
+    image: redis:7-alpine
+    container_name: rcbl_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: rcbl_minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: rcbl_jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  # ── Application ──────────────────────────────────────────────────────────────
+
+  api:
+    build:
+      context: ./rcbl-backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rcbl_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rcbl_admin:rcbl_secret@postgres:5432/rcbl
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-key-change-in-production
+      S3_BUCKET: rcbl-invoices
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-placeholder}
+      ENVIRONMENT: development
+      ALLOWED_ORIGINS: '["http://localhost:3000"]'
+      OTLP_ENDPOINT: http://jaeger:4317
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build:
+      context: ./rcbl-backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rcbl_worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    command: ["arq", "src.worker.WorkerSettings"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rcbl_admin:rcbl_secret@postgres:5432/rcbl
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-secret-key-change-in-production
+      S3_BUCKET: rcbl-invoices
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-placeholder}
+      ENVIRONMENT: development
+      OTLP_ENDPOINT: http://jaeger:4317
+
+volumes:
+  pgdata:
+  miniodata:
