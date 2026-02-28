@@ -33,6 +33,18 @@ configure_logging()
 logger = structlog.get_logger(__name__)
 
 
+def _rate_limit_exceeded_handler_with_logging(request: Request, exc: RateLimitExceeded):
+    """Rate limit handler that logs before delegating to slowapi's default handler."""
+    logger.warning(
+        "rate_limit.exceeded",
+        path=str(request.url.path),
+        method=request.method,
+        client_ip=request.client.host if request.client else None,
+        detail=str(exc.detail),
+    )
+    return _rate_limit_exceeded_handler(request, exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: configure tracing, create shared arq pool, ensure S3 bucket. Shutdown: cleanup."""
@@ -79,7 +91,7 @@ def create_app() -> FastAPI:
     # causes AttributeError on every request. The decorator alone is sufficient for enforcement;
     # response header injection (X-RateLimit-*) is a nice-to-have, not a requirement.
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler_with_logging)
 
     # ── Middleware stack (registered bottom-up, executed top-down) ─────────────
     app.add_middleware(

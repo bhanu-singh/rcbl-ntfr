@@ -69,7 +69,17 @@ async def login(db: AsyncSession, payload: LoginRequest) -> tuple[User, TokenRes
     Raises UnauthorizedError on bad credentials.
     """
     user = await repository.get_user_by_email(db, payload.email)
-    if not user or not await verify_password(payload.password, user.password_hash):
+    if not user:
+        logger.warning("auth.login_failed", reason="user_not_found", email=payload.email)
+        raise UnauthorizedError("Invalid email or password")
+    
+    if not await verify_password(payload.password, user.password_hash):
+        logger.warning(
+            "auth.login_failed",
+            reason="invalid_password",
+            user_id=str(user.id),
+            company_id=str(user.company_id),
+        )
         raise UnauthorizedError("Invalid email or password")
 
     await repository.update_last_login(db, user)
@@ -92,14 +102,17 @@ async def refresh_access_token(refresh_token: str) -> TokenResponse:
 
     payload = decode_token(refresh_token)
     if payload is None or payload.get("type") != REFRESH_TOKEN_TYPE:
+        logger.warning("auth.refresh_failed", reason="invalid_or_expired_token")
         raise UnauthorizedError("Invalid or expired refresh token")
 
     user_id = payload.get("sub")
     company_id = payload.get("company_id")
     if not user_id or not company_id:
+        logger.warning("auth.refresh_failed", reason="malformed_token")
         raise UnauthorizedError("Malformed token")
 
     access_token, _ = create_access_token(user_id, company_id)
+    logger.info("auth.token_refreshed", user_id=user_id, company_id=company_id)
     return TokenResponse(
         access_token=access_token,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,

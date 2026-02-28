@@ -17,6 +17,9 @@ REGISTER_PAYLOAD = {
 }
 
 
+# ── Register Tests ────────────────────────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
 async def test_register_success(client: AsyncClient) -> None:
     response = await client.post("/api/auth/register", json=REGISTER_PAYLOAD)
@@ -32,6 +35,7 @@ async def test_register_duplicate_email(client: AsyncClient) -> None:
     await client.post("/api/auth/register", json=REGISTER_PAYLOAD)
     response = await client.post("/api/auth/register", json=REGISTER_PAYLOAD)
     assert response.status_code == 409
+    assert response.json()["error"] == "CONFLICT"
 
 
 @pytest.mark.asyncio
@@ -48,6 +52,9 @@ async def test_register_invalid_email(client: AsyncClient) -> None:
     assert response.status_code == 422
 
 
+# ── Login Tests ──────────────────────────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
 async def test_login_success(client: AsyncClient) -> None:
     await client.post("/api/auth/register", json=REGISTER_PAYLOAD)
@@ -56,7 +63,9 @@ async def test_login_success(client: AsyncClient) -> None:
         json={"email": REGISTER_PAYLOAD["user_email"], "password": REGISTER_PAYLOAD["password"]},
     )
     assert response.status_code == 200
-    assert "access_token" in response.json()
+    data = response.json()
+    assert "access_token" in data
+    assert data["token_type"] == "bearer"
 
 
 @pytest.mark.asyncio
@@ -67,6 +76,68 @@ async def test_login_wrong_password(client: AsyncClient) -> None:
         json={"email": REGISTER_PAYLOAD["user_email"], "password": "wrongpass"},
     )
     assert response.status_code == 401
+    assert response.json()["error"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_login_nonexistent_user(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/auth/login",
+        json={"email": "nonexistent@example.com", "password": "anypassword"},
+    )
+    assert response.status_code == 401
+    assert response.json()["error"] == "UNAUTHORIZED"
+
+
+# ── Refresh Token Tests ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_success(client: AsyncClient) -> None:
+    """Login and use the refresh_token cookie to get a new access token."""
+    await client.post("/api/auth/register", json=REGISTER_PAYLOAD)
+    login_response = await client.post(
+        "/api/auth/login",
+        json={"email": REGISTER_PAYLOAD["user_email"], "password": REGISTER_PAYLOAD["password"]},
+    )
+    assert login_response.status_code == 200
+    
+    # Extract refresh_token from cookies
+    cookies = login_response.cookies
+    refresh_token = cookies.get("refresh_token")
+    assert refresh_token is not None
+    
+    # Use refresh token to get new access token
+    response = await client.post(
+        "/api/auth/refresh",
+        cookies={"refresh_token": refresh_token},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "access_token" in data
+    assert data["token_type"] == "bearer"
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_missing_cookie(client: AsyncClient) -> None:
+    """Refresh without cookie should return 401."""
+    response = await client.post("/api/auth/refresh")
+    assert response.status_code == 401
+    assert response.json()["error"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_invalid(client: AsyncClient) -> None:
+    """Refresh with invalid token should return 401."""
+    response = await client.post(
+        "/api/auth/refresh",
+        cookies={"refresh_token": "invalid.token.here"},
+    )
+    assert response.status_code == 401
+    assert response.json()["error"] == "UNAUTHORIZED"
+
+
+# ── Protected Route Tests ────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -82,7 +153,25 @@ async def test_me_with_token(client: AsyncClient, auth_headers: dict) -> None:
     data = response.json()
     assert "user" in data
     assert "company" in data
-    assert data["user"]["email"] == "user@test.com"
+    assert data["user"]["email"].endswith("@test.com")
+
+
+@pytest.mark.asyncio
+async def test_me_with_invalid_token(client: AsyncClient) -> None:
+    response = await client.get("/api/auth/me", headers={"Authorization": "Bearer invalid.token"})
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_me_with_expired_token(client: AsyncClient) -> None:
+    """Test with a token that has an expired signature."""
+    # This is a JWT with expired exp claim
+    expired_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwiY29tcGFueV9pZCI6IjEyMzQ1Njc4LTkwMTItMzQ1Ni03ODkwLTEyMzQ1Njc4OTAxMiIsInR5cGUiOiJhY2Nlc3MiLCJqdGkiOiIxMjM0NTY3ODkwIiwiaWF0IjoxNTE2MjM5MDIyLCJleHAiOjE1MTYyMzkwMjJ9.4Adcj3UFYzP5ZI9zH7y3E8pV6dU_0K6U6iI3PzVN6Qk"
+    response = await client.get("/api/auth/me", headers={"Authorization": f"Bearer {expired_token}"})
+    assert response.status_code == 401
+
+
+# ── Logout Tests ──────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio

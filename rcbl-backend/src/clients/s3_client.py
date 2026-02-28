@@ -82,3 +82,10 @@ async def ensure_bucket_exists() -> None:
         except Exception:
             await s3.create_bucket(Bucket=settings.S3_BUCKET)
             logger.info("s3.bucket_created", bucket=settings.S3_BUCKET)
+
+
+async def head_bucket(bucket: str) -> bool:
+    """Check if a bucket exists and is accessible."""
+    async with _s3_resource() as s3:
+        await s3.head_bucket(Bucket=bucket)
+    return True

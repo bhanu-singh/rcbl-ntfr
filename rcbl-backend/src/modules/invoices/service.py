@@ -15,7 +15,13 @@ from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.clients import s3_client
-from src.core.exceptions import NotFoundError, UnprocessableError
+from src.core.exceptions import (
+    DateValidationError,
+    FileValidationError,
+    IncompleteOCRDataError,
+    InvalidItemStatusError,
+    NotFoundError,
+)
 from src.modules.invoices import repository
 from src.modules.invoices.models import (
     BatchUploadType,
@@ -94,7 +100,7 @@ async def upload_bulk(
 ) -> BulkUploadResponse:
     """Upload multiple PDFs, create one batch with N items, enqueue N OCR jobs."""
     if not files:
-        raise UnprocessableError("At least one file is required")
+        raise FileValidationError("At least one file is required")
 
     batch = await repository.create_batch(
         db,
@@ -183,8 +189,9 @@ async def accept_item(
     item = await get_item(db, item_id, company_id)
 
     if item.status not in (ItemStatus.ready.value, ItemStatus.review_pending.value):
-        raise UnprocessableError(
-            f"Item status is '{item.status}' — only 'ready' or 'review_pending' items can be accepted"
+        raise InvalidItemStatusError(
+            current_status=item.status,
+            allowed_statuses=[ItemStatus.ready.value, ItemStatus.review_pending.value],
         )
 
     # Merge: OCR data is the base, user overrides take precedence
@@ -210,14 +217,11 @@ async def accept_item(
         missing.append("due_date")
 
     if missing:
-        raise UnprocessableError(
-            f"Cannot create invoice — missing required fields: {', '.join(missing)}. "
-            "Provide them in the request body to override OCR results."
-        )
+        raise IncompleteOCRDataError(missing_fields=missing)
 
     # Final cross-field check (mirrors DB CONSTRAINT due_after_invoice)
     if due_date < invoice_date:  # type: ignore[operator]
-        raise UnprocessableError("due_date must be on or after invoice_date")
+        raise DateValidationError("due_date must be on or after invoice_date")
 
     invoice = await repository.create_invoice(
         db,
@@ -262,8 +266,13 @@ async def reject_item(
         ItemStatus.review_pending.value,
         ItemStatus.queued.value,
     ):
-        raise UnprocessableError(
-            f"Item status is '{item.status}' — cannot reject an already accepted/failed item"
+        raise InvalidItemStatusError(
+            current_status=item.status,
+            allowed_statuses=[
+                ItemStatus.ready.value,
+                ItemStatus.review_pending.value,
+                ItemStatus.queued.value,
+            ],
         )
 
     await repository.update_item_status(db, item.id, ItemStatus.rejected)
@@ -278,17 +287,17 @@ async def reject_item(
 async def _read_and_validate_file(file: UploadFile) -> bytes:
     content_type = file.content_type or ""
     if content_type and content_type not in _ALLOWED_CONTENT_TYPES:
-        raise UnprocessableError(
+        raise FileValidationError(
             f"Unsupported file type '{content_type}'. Allowed: PDF, JPEG, PNG, TIFF"
         )
 
     file_bytes = await file.read()
     if len(file_bytes) > _MAX_FILE_SIZE_BYTES:
-        raise UnprocessableError(
+        raise FileValidationError(
             f"File '{file.filename}' exceeds 20 MB limit ({len(file_bytes)} bytes)"
         )
     if len(file_bytes) == 0:
-        raise UnprocessableError(f"File '{file.filename}' is empty")
+        raise FileValidationError(f"File '{file.filename}' is empty")
 
     return file_bytes
 

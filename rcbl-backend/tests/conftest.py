@@ -54,15 +54,14 @@ async def create_tables():
         await conn.run_sync(Base.metadata.drop_all)
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function")
 async def db_session():
-    """Yield a test DB session that rolls back after each test."""
+    """Yield a test DB session that creates a fresh session for each test."""
     async with _test_session_factory() as session:
         yield session
-        await session.rollback()
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function")
 async def client(db_session: AsyncSession):
     """
     httpx AsyncClient wired to the FastAPI app.
@@ -96,20 +95,26 @@ async def client(db_session: AsyncSession):
 
 # ── Auth helpers ───────────────────────────────────────────────────────────────
 
-REGISTER_PAYLOAD = {
-    "company_name": "Test Company",
-    "company_email": "company@test.com",
-    "user_name": "Test User",
-    "user_email": "user@test.com",
-    "password": "password123",
-    "timezone": "UTC",
-}
+
+def _get_unique_test_data():
+    """Generate unique test data for each test."""
+    import uuid
+    unique_id = str(uuid.uuid4())[:8]
+    return {
+        "company_name": f"Test Company {unique_id}",
+        "company_email": f"company-{unique_id}@test.com",
+        "user_name": f"Test User {unique_id}",
+        "user_email": f"user-{unique_id}@test.com",
+        "password": "password123",
+        "timezone": "UTC",
+    }
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function")
 async def auth_headers(client: AsyncClient) -> dict[str, str]:
     """Register a test user and return Authorization headers."""
-    response = await client.post("/api/auth/register", json=REGISTER_PAYLOAD)
+    payload = _get_unique_test_data()
+    response = await client.post("/api/auth/register", json=payload)
     assert response.status_code == 201, f"Registration failed: {response.text}"
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}

@@ -26,6 +26,16 @@ ocr_jobs_total = Counter(
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 
+def _inject_trace_context(logger, method_name, event_dict):
+    """Inject OpenTelemetry trace_id and span_id into log records."""
+    span = trace.get_current_span()
+    if span and span.get_span_context().is_valid:
+        ctx = span.get_span_context()
+        event_dict["trace_id"] = format(ctx.trace_id, "032x")
+        event_dict["span_id"] = format(ctx.span_id, "016x")
+    return event_dict
+
+
 def _get_shared_processors() -> list:
     return [
         structlog.contextvars.merge_contextvars,
@@ -33,6 +43,7 @@ def _get_shared_processors() -> list:
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
+        _inject_trace_context,  # Add trace_id/span_id to every log
     ]
 
 
